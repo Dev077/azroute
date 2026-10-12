@@ -27,7 +27,8 @@ Training stability:
     on passes over the replay buffer per iteration, early stopping on held-out
     episodes in the warm start, a loss on unseen episodes every iteration, and
     best.pt (best evaluation score) kept separately from latest.pt
-  * smooth end of training: cosine learning-rate decay over --max-hours
+  * smooth end of training: cosine learning-rate decay over --max-hours (constant
+    learning rate after warmup when there is no hour limit)
 
 Stops at --iters, when --max-hours would be exceeded, or (with --plateau-evals)
 when the evaluation score hasn't improved for that many evaluations, always
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import math
 import os
@@ -234,7 +236,7 @@ def main(argv=None):
     ap.add_argument("--patience", type=int, default=3,
                     help="warm start stops after this many checks (every 100 steps) without improvement")
     # self-play
-    ap.add_argument("--iters", type=int, default=1000)
+    ap.add_argument("--iters", type=int, default=1000, help="self-play iterations (0 = no limit)")
     ap.add_argument("--episodes", type=int, default=6, help="self-play episodes per iteration")
     ap.add_argument("--train-steps", type=int, default=150,
                     help="gradient steps per iteration (capped at --max-passes over the buffer)")
@@ -244,9 +246,10 @@ def main(argv=None):
     ap.add_argument("--buffer", type=int, default=15000, help="replay buffer size (~150 KB/sample)")
     # optimisation
     ap.add_argument("--lr", type=float, default=3e-4, help="peak learning rate")
-    ap.add_argument("--warmup-steps", type=int, default=200)
+    ap.add_argument("--warmup-steps", type=int, default=1000)
     ap.add_argument("--min-lr-frac", type=float, default=0.1,
-                    help="learning rate decays (cosine, over --max-hours) to this fraction of --lr")
+                    help="learning rate decays (cosine, over --max-hours) to this fraction of --lr; "
+                         "without --max-hours it stays at --lr")
     ap.add_argument("--wd", type=float, default=0.01, help="AdamW weight decay (weights only)")
     ap.add_argument("--clip", type=float, default=1.0, help="gradient-norm clip")
     # evaluation on a real tier
@@ -400,7 +403,7 @@ def main(argv=None):
 
         # ---- 2. self-play -----------------------------------------------------
         last_iter_s = 0.0
-        for it in range(start_iter, args.iters):
+        for it in (range(start_iter, args.iters) if args.iters > 0 else itertools.count(start_iter)):
             if spent() + 1.2 * last_iter_s > budget:
                 log(f"stopping: --max-hours {args.max_hours} reached "
                     f"({spent() / 3600:.2f} h used, next iteration ~{last_iter_s / 60:.0f} min)")

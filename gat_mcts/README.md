@@ -27,15 +27,15 @@ The notebook then:
 - clones the challenge toolkit (pinned to the tested commit) and your repo
 - runs a 3–5 minute self-test of every step
 - generates the training data once
-- trains for `TRAIN_HOURS`
+- trains until the evaluation score plateaus (`PLATEAU_EVALS`; no hour limit)
 - scores all 9 hard-tier cases into a leaderboard-format submission
 - **disconnects the runtime**
 
 Any error also disconnects the runtime (with `AUTO_SHUTDOWN = True`), so a
 failure doesn't keep using compute units. Everything is saved in Drive under
 `MyDrive/gat_mcts_work/`. If Colab drops, Run all again: the data is reused and
-training resumes. `TRAIN_HOURS` is the total across sessions, so a resume never
-goes over budget; raise it to train longer.
+training resumes. There is no hour limit, so a long run can use many units;
+interrupt the training cell to stop sooner (`latest.pt` is kept).
 
 ## Requirements
 
@@ -123,9 +123,9 @@ Checkpoints store their own size, so older checkpoints still load.
 | risk | what guards against it |
 |---|---|
 | exploding gradients | gradient-norm clipping (`--clip 1.0`); steps with a non-finite loss or gradient are skipped; if most of an iteration's steps are bad, the last good checkpoint is restored |
-| vanishing gradients | residual + LayerNorm in every layer; a numerically stable log-softmax for the policy loss; learning-rate warmup (`--warmup-steps 200`) |
+| vanishing gradients | residual + LayerNorm in every layer; a numerically stable log-softmax for the policy loss; learning-rate warmup (`--warmup-steps 1000`) |
 | overfitting | dropout 0.1 (attention and messages); AdamW weight decay 0.01 on weights (not biases/norms); at most `--max-passes 4` passes over the buffer per iteration; warm-start early stopping on held-out episodes; loss on each iteration's new, unseen episodes logged before training on them; `best.pt` kept apart from `latest.pt` |
-| a rough end of training | cosine learning-rate decay to 10% over `--max-hours` |
+| a rough end of training | cosine learning-rate decay to 10% over `--max-hours` (constant after warmup without it, as in the notebook) |
 
 The Colab report plots train loss against the unseen-episode loss (a growing
 gap means overfitting) and the gradient norm before clipping.
@@ -149,12 +149,11 @@ workers load new weights into the same compiled module, so they don't
 recompile every iteration. Compiling takes a few minutes at the start of a
 session.
 
-How long: set `TRAIN_HOURS` to the most you're willing to spend on this run
-(default 4) and keep `PLATEAU_EVALS = 5`, which stops early once the evaluation
-score (every 10 iterations) hasn't improved for 5 evaluations. After a run,
-look at the eval `search` scores in the report: still rising at the end → raise
-`TRAIN_HOURS` and Run all again (it resumes); flat → more hours won't help
-without changes (a bigger training pool, more simulations, a different model size).
+How long: the notebook has no hour limit; `PLATEAU_EVALS = 5` stops training
+once the evaluation score (every 10 iterations) hasn't improved for 5
+evaluations. Raise it to be more patient, lower it to stop sooner. After a run,
+look at the eval `search` scores in the report: if they plateaued, more training
+won't help without changes (a bigger training pool, more simulations, a different model size).
 
 ## Reading the training log (`log.jsonl` / cell output)
 
@@ -170,7 +169,8 @@ without changes (a bigger training pool, more simulations, a different model siz
 
 Tested locally (CPU) from a copy outside the challenge repo: the self-test, the
 notebook flow (with Colab's Drive/secret/shutdown calls simulated), legal
-hard-tier submissions accepted by `m3d.scorer`, resume and the hour budget.
+hard-tier submissions accepted by `m3d.scorer`, resume and the hour budget
+(`--max-hours`, still available on the command line).
 Not tested on an actual Colab GPU. The notebook's self-test step is there to
 catch environment differences before training starts. It hasn't been trained
 for real yet, so there are no meaningful scores. Reference points on
