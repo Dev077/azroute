@@ -19,7 +19,7 @@ def _mlp(i, h, o):
 
 
 class RouteGAT(nn.Module):
-    def __init__(self, hidden: int = 128, heads: int = 4, layers: int = 5,
+    def __init__(self, hidden: int = 152, heads: int = 4, layers: int = 6,
                  dropout: float = 0.0):
         super().__init__()
         assert hidden % heads == 0

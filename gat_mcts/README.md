@@ -6,7 +6,7 @@ predicts the final score (value), MCTS uses both to pick the next move, and the
 chosen route is laid down exactly. A cleanup pass runs on the finished board.
 
 ```
-state ──► graph (nets, candidate routes, regions) ──► GATv2 (5 layers)
+state ──► graph (nets, candidate routes, regions) ──► GATv2 (6 layers, ~3.0M parameters)
                                                        ├─► policy: logit per candidate
                                                        └─► value: final score, P(legal)
 MCTS (PUCT) picks (net, candidate) ──► lay route ──► repair if a net got cut off ──► next state
@@ -88,7 +88,11 @@ bound, wirelength, vias, which layers it uses, and how much it overlaps other
 candidates and hugs other nets' pins. Each region (a tile of one layer) knows
 its layer cost, occupancy, pin density and future demand. Conflict edges link
 candidates of different nets that share a vertex. Information spreads one hop
-per GAT layer, so 5 layers let a net see the nets it competes with.
+per GAT layer. A net is about 4 hops from a net it competes with
+(net → candidate → region → candidate → net), so 6 layers cover that with a
+hop to spare. Defaults: width 152, 4 heads, 6 layers ≈ 3.0M parameters
+(`--hidden`, `--heads`, `--layers`; width must be divisible by heads).
+Checkpoints store their own size, so older checkpoints still load.
 
 ## Design decisions (measured on `benchmarks_hard`)
 

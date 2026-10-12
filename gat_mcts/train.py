@@ -67,10 +67,10 @@ def main(argv=None):
     ap.add_argument("--max-hours", type=float, default=0.0,
                     help="training budget in hours, summed over every session of this --out "
                          "(resumes included); stops before an iteration would exceed it (0 = none)")
-    # model
-    ap.add_argument("--hidden", type=int, default=128)
+    # model (defaults: ~3.0M parameters; hidden must be divisible by heads)
+    ap.add_argument("--hidden", type=int, default=152)
     ap.add_argument("--heads", type=int, default=4)
-    ap.add_argument("--layers", type=int, default=5)
+    ap.add_argument("--layers", type=int, default=6)
     # environment / search
     ap.add_argument("--frontier", type=int, default=4, help="nets MCTS may choose between")
     ap.add_argument("--rip-limit", type=int, default=8)
