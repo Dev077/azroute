@@ -118,6 +118,44 @@ Checkpoints store their own size, so older checkpoints still load.
    and `evaluate.py` also print the search's own score (`search`), which is the
    number that shows whether training is working.
 
+## Training stability
+
+| risk | what guards against it |
+|---|---|
+| exploding gradients | gradient-norm clipping (`--clip 1.0`); steps with a non-finite loss or gradient are skipped; if most of an iteration's steps are bad, the last good checkpoint is restored |
+| vanishing gradients | residual + LayerNorm in every layer; a numerically stable log-softmax for the policy loss; learning-rate warmup (`--warmup-steps 200`) |
+| overfitting | dropout 0.1 (attention and messages); AdamW weight decay 0.01 on weights (not biases/norms); at most `--max-passes 4` passes over the buffer per iteration; warm-start early stopping on held-out episodes; loss on each iteration's new, unseen episodes logged before training on them; `best.pt` kept apart from `latest.pt` |
+| a rough end of training | cosine learning-rate decay to 10% over `--max-hours` |
+
+The Colab report plots train loss against the unseen-episode loss (a growing
+gap means overfitting) and the gradient norm before clipping.
+
+## GPU use and how long to train
+
+Self-play (shortest-path searches, graph building) is CPU work in Python; the
+GPU runs the network during search and the training steps. With `--workers > 1`
+the GPU trains on the replay buffer *while* the workers play the next episodes
+(the iteration log shows `N steps (M during self-play)`), so neither waits for
+the other. The number of gradient steps per iteration stays capped, because
+training more on the same data would only overfit. On a 2-core T4 runtime
+the CPU is the limit and the GPU is often idle; more CPU cores (more workers)
+is what raises both throughput and GPU use. Each iteration logs GPU
+utilisation (from `nvidia-smi`) and samples generated per hour.
+
+torch.compile is on by default (`--no-compile` on `train`/`evaluate` turns it
+off). It compiles the network's tensor core (`RouteGAT._core`, with dynamic
+shapes) in the training process and once per self-play / evaluation worker;
+workers load new weights into the same compiled module, so they don't
+recompile every iteration. Compiling takes a few minutes at the start of a
+session.
+
+How long: set `TRAIN_HOURS` to the most you're willing to spend on this run
+(default 4) and keep `PLATEAU_EVALS = 5`, which stops early once the evaluation
+score (every 10 iterations) hasn't improved for 5 evaluations. After a run,
+look at the eval `search` scores in the report: still rising at the end → raise
+`TRAIN_HOURS` and Run all again (it resumes); flat → more hours won't help
+without changes (a bigger training pool, more simulations, a different model size).
+
 ## Reading the training log (`log.jsonl` / cell output)
 
 * `warm` lines: `score` mostly 0.9–1.0 and `legal` true.

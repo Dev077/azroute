@@ -43,6 +43,8 @@ def main(argv=None):
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                     help="device for the network during search")
     ap.add_argument("--workers", type=int, default=1, help="cases routed in parallel")
+    ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="torch.compile the network (--no-compile to turn off)")
     ap.add_argument("--author", default="Your Name or Handle")
     args = ap.parse_args(argv)
     if args.evaluator == "net" and not args.ckpt:
@@ -63,7 +65,8 @@ def main(argv=None):
               "model_path": os.path.abspath(args.ckpt) if args.ckpt else None, "model_tag": 0,
               "device": args.device, "evaluator": args.evaluator, "sims": args.sims,
               "c_puct": args.c_puct, "frontier": args.frontier, "rip_limit": args.rip_limit,
-              "cleanup_seconds": args.cleanup_seconds, "out": args.out} for c in cases]
+              "cleanup_seconds": args.cleanup_seconds, "out": args.out,
+              "compile": args.compile} for c in cases]
     runtimes = {}
     runner = Runner(args.workers)
     try:

@@ -94,13 +94,19 @@ def main(argv=None):
               "--warm-steps", "3", "--iters", "1", "--episodes", "2", "--sims", "2",
               "--train-steps", "2", "--eval-every", "1", "--eval-cases", "1", "--eval-sims", "2",
               "--eval-cleanup", "1", "--workers", w], cwd)
-        for f in ("warm.pt", "latest.pt", "iter_0000.pt", "log.jsonl"):
+        for f in ("warm.pt", "latest.pt", "iter_0000.pt", "best.pt", "best.json", "log.jsonl"):
             if not os.path.exists(os.path.join(run, f)):
                 raise RuntimeError(f"{f} was not written")
-        kinds = {json.loads(l)["kind"] for l in open(os.path.join(run, "log.jsonl"))}
-        missing = {"warm", "warm_train", "selfplay", "iter", "eval"} - kinds
+        recs = [json.loads(l) for l in open(os.path.join(run, "log.jsonl"))]
+        missing = {"warm", "warm_val", "warm_train", "selfplay", "iter", "eval"} - {r["kind"] for r in recs}
         if missing:
             raise RuntimeError(f"log is missing {missing}")
+        it = [r for r in recs if r["kind"] == "iter"][-1]
+        for k in ("loss", "grad_norm", "lr"):
+            if not (isinstance(it.get(k), (int, float)) and it[k] == it[k] and abs(it[k]) != float("inf")):
+                raise RuntimeError(f"iteration log has a bad {k}: {it.get(k)}")
+        if not it.get("fresh"):
+            raise RuntimeError("iteration log has no unseen-data loss")
     _step("training: warm start, self-play, evaluation", train_fresh)
 
     _step("training: resume", lambda: _run(
