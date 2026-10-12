@@ -1,0 +1,4 @@
+# GAT + MCTS router (gat_mcts/). The m3d toolkit itself needs nothing here.
+torch>=2.0
+torch_geometric>=2.4
+numpy

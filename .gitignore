@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.png
+!docs/*.png
+*.sol.json
+!benchmarks/reference/*.sol.json
+!benchmarks_hard/reference/*.sol.json
+!benchmarks_scale/reference/*.sol.json
+!benchmarks_stress/reference/*.sol.json
+!benchmarks_congested/reference/*.sol.json
+!benchmarks_designs/reference/*.sol.json
+!examples/submissions/*.sol.json
+!submissions/*/*/*.sol.json
+.venv/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# gat_mcts training artifacts
+gat_mcts_data/
+runs/
+submissions_local/
+.DS_Store
