@@ -18,7 +18,7 @@ import torch
 from .data import benchmark_problem, pool_problem
 from .mcts import MCTS
 from .model import RouteGAT
-from .selfplay import label_samples, play, play_guided, solve
+from .selfplay import label_samples, play, play_guided, solve, window_state
 
 _model = None
 _model_tag = None
@@ -59,21 +59,28 @@ def unpack_samples(blob: bytes):
 
 
 def run_episode(task: dict) -> dict:
-    """task: kind ("warm" | "mcts"), data, entry, seed, frontier, rip_limit, plus
-    eps (warm) or model_path, model_tag, device, sims, c_puct, temp_moves, compile (mcts)."""
+    """task: kind ("warm" | "mcts"), data, entry, seed, frontier, rip_limit, window,
+    full_max_nets, plus eps (warm) or model_path, model_tag, device, sims, c_puct,
+    temp_moves, compile (mcts). Boards with more than full_max_nets nets play a
+    window of that many nets (window_state); the rest start on their reference routes."""
     rng = random.Random(task["seed"])
     prob = pool_problem(task["data"], task["entry"], frontier=task["frontier"],
                         rip_limit=task["rip_limit"], seed=task["seed"])
+    start = None
+    if task.get("window") and prob.n > task.get("full_max_nets", 0):
+        start = window_state(prob, task["window"], rng)
+    window = len(start.unrouted) if start is not None else None
     if task["kind"] == "warm":
-        ep = play_guided(prob, task["eps"], rng)
+        ep = play_guided(prob, task["eps"], rng, start=start)
     else:
         model = _get_model(task["model_path"], task["model_tag"], task["device"],
                            task.get("compile", False))
         mcts = MCTS(prob, model, task["device"], c_puct=task["c_puct"], rng=rng)
-        ep = play(prob, mcts, task["sims"], train=True, temp_moves=task["temp_moves"])
+        ep = play(prob, mcts, task["sims"], train=True, temp_moves=task["temp_moves"],
+                  start=start)
     return {"samples": pack_samples(label_samples(ep)), "score": ep.score, "legal": ep.legal,
             "moves": ep.moves, "seconds": ep.seconds, "instance": task["entry"]["name"],
-            "n": prob.n, "eps": task.get("eps")}
+            "n": prob.n, "window": window, "eps": task.get("eps")}
 
 
 def solve_case(task: dict) -> dict:

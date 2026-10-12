@@ -4,7 +4,7 @@ A pool directory holds, per instance:
   <name>.json           the instance (m3d-instance)
   <name>.ref.sol.json   the negotiated router's legal solution
   <name>.hist.json      the negotiated router's per-vertex history costs
-and index.json listing {name, baseline_total, style, side, n_nets}.
+and index.json listing {name, baseline_total, tier, side, n_nets}.
 """
 from __future__ import annotations
 

@@ -93,7 +93,7 @@ def main(argv=None):
         _run(["gat_mcts.train", "--data", data, "--out", run, "--warm-episodes", "3",
               "--warm-steps", "3", "--iters", "1", "--episodes", "2", "--sims", "2",
               "--train-steps", "2", "--eval-every", "1", "--eval-cases", "1", "--eval-sims", "2",
-              "--eval-cleanup", "1", "--workers", w], cwd)
+              "--eval-cleanup", "1", "--full-max-nets", "0", "--window", "8", "--workers", w], cwd)
         for f in ("warm.pt", "latest.pt", "iter_0000.pt", "best.pt", "best.json", "log.jsonl"):
             if not os.path.exists(os.path.join(run, f)):
                 raise RuntimeError(f"{f} was not written")
@@ -107,12 +107,19 @@ def main(argv=None):
                 raise RuntimeError(f"iteration log has a bad {k}: {it.get(k)}")
         if not it.get("fresh"):
             raise RuntimeError("iteration log has no unseen-data loss")
+        if not all(r.get("window") == 8 for r in recs if r["kind"] in ("warm", "selfplay")):
+            raise RuntimeError("--full-max-nets 0 --window 8: every episode should route a window of 8 nets")
     _step("training: warm start, self-play, evaluation", train_fresh)
 
-    _step("training: resume", lambda: _run(
-        ["gat_mcts.train", "--data", data, "--out", run, "--resume", os.path.join(run, "latest.pt"),
-         "--iters", "2", "--episodes", "1", "--sims", "2", "--train-steps", "2",
-         "--eval-every", "0", "--workers", w], cwd))
+    def resume():
+        _run(["gat_mcts.train", "--data", data, "--out", run, "--resume", os.path.join(run, "latest.pt"),
+              "--iters", "2", "--episodes", "1", "--sims", "2", "--train-steps", "2",
+              "--eval-every", "0", "--workers", w], cwd)
+        last = [json.loads(l) for l in open(os.path.join(run, "log.jsonl"))
+                if '"selfplay"' in l][-1]
+        if last.get("window") is not None:
+            raise RuntimeError("small boards should play whole episodes by default")
+    _step("training: resume (whole-board episodes)", resume)
 
     def evaluate():
         out = _run(["gat_mcts.evaluate", "--tier", "hard", "--ckpt", os.path.join(run, "latest.pt"),

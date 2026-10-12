@@ -29,17 +29,39 @@ class Episode:
     samples: list = field(default_factory=list)   # (HeteroData, visit policy) per decision
 
 
+def window_state(prob: Problem, size: int, rng: random.Random) -> State:
+    """A large board with every net laid on its reference route except ``size`` nets
+    clustered around a random one, which are left for the episode to route. An
+    episode then costs about what one on a small board does but still sees
+    large-board congestion; its score is the whole board's. The reference routes
+    are a legal solution, so the left-out nets can always be routed."""
+    if any(r is None for r in prob.ref):
+        return State.initial(prob)
+
+    def centre(i):
+        x0, x1, y0, y1, _, _ = prob.bbox[i]
+        return (x0 + x1) / 2, (y0 + y1) / 2
+    cx, cy = centre(rng.randrange(prob.n))
+    near = sorted(range(prob.n), key=lambda i: (centre(i)[0] - cx) ** 2 + (centre(i)[1] - cy) ** 2)
+    left = set(near[:size])
+    state = State.initial(prob)
+    for i in range(prob.n):
+        if i not in left:
+            state.lay(prob, prob.ref[i])
+    return state
+
+
 def play(prob: Problem, mcts: MCTS, sims: int, train: bool, temp_moves: float = 0.3,
-         verbose: bool = False) -> Episode:
-    """Route the board from empty. With ``train`` the root gets Dirichlet noise and
-    moves are sampled from the visit counts for the first ``temp_moves`` fraction of
-    the episode; otherwise the most-visited move is played."""
+         verbose: bool = False, start: Optional[State] = None) -> Episode:
+    """Route the board from empty (or from ``start``). With ``train`` the root gets
+    Dirichlet noise and moves are sampled from the visit counts for the first
+    ``temp_moves`` fraction of the episode; otherwise the most-visited move is played."""
     t0 = time.time()
     mcts.reset()
-    root = Node(State.initial(prob))
+    root = Node(start if start is not None else State.initial(prob))
     samples = []
     moves = 0
-    temp_until = int(temp_moves * prob.n)
+    temp_until = int(temp_moves * len(root.state.unrouted))
     while True:
         if not root.expanded:
             mcts.expand(root)
@@ -86,13 +108,14 @@ def _guide(prob: Problem, frontier, actions) -> int:
     return min(first, key=lambda i: actions[i].delay)
 
 
-def play_guided(prob: Problem, eps: float, rng: random.Random) -> Episode:
+def play_guided(prob: Problem, eps: float, rng: random.Random,
+                start: Optional[State] = None) -> Episode:
     """Warm-start episode, no search: follow the teacher, but with probability
     ``eps`` play a random candidate instead. Policy targets are the teacher's
     move; the value target is the score the perturbed episode actually reached,
     so the value head learns which deviations end in failure and which pay off."""
     t0 = time.time()
-    state = State.initial(prob)
+    state = start if start is not None else State.initial(prob)
     samples = []
     moves = 0
     while not state.done and not state.failed:

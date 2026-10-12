@@ -52,7 +52,7 @@ export M3D_CHALLENGE_ROOT=/path/to/challenge
 pip install -r gat_mcts/requirements.txt
 
 python -m gat_mcts.selftest --workers 2                     # ~3-5 min sanity check
-python -m gat_mcts.gen_data --out data --n 150 --workers 4  # training pool (resumable)
+python -m gat_mcts.gen_data --out data --n 150 --workers 4  # training pool (resumable; --mix picks the tiers)
 python -m gat_mcts.train --data data --out runs/r1 --max-hours 3 --workers 4
 python -m gat_mcts.train --data data --out runs/r1 --max-hours 6 --workers 4 --resume runs/r1/latest.pt
 python -m gat_mcts.evaluate --tier hard --ckpt runs/r1/latest.pt --workers 4 --out submissions/hard/r1
@@ -72,7 +72,7 @@ python -m gat_mcts.evaluate --tier hard --evaluator rollout --sims 16 --out subm
 | `selfplay.py` | warm-start episodes, MCTS self-play episodes, `solve()` for evaluation |
 | `cleanup.py` | rip-up-and-reroute pass on a finished board |
 | `workers.py` | parallel episodes and case solving (spawned processes, CUDA-safe) |
-| `gen_data.py` | training pool from the challenge's own generator (different seed from the benchmarks) |
+| `gen_data.py` | training pool from the hard / congested / scale tiers' generator recipes (`--mix`; different seed from the benchmarks) |
 | `train.py` | warm start + self-play training loop, time budget, checkpoints, periodic evaluation |
 | `evaluate.py` | route a tier with a checkpoint, write a leaderboard-format submission, score it |
 | `selftest.py` | runs every entry point at tiny scale |

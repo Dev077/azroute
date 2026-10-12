@@ -659,10 +659,10 @@ class State:
         return s
 
 
-def negotiate(inst: Instance) -> Tuple[Optional[Submission], Dict[int, float]]:
+def negotiate(inst: Instance, order: str = "bbox_desc") -> Tuple[Optional[Submission], Dict[int, float]]:
     """Run the toolkit's negotiated-congestion router; return its legal solution
     (None if it fails) and its per-vertex history costs (vid -> history)."""
     from m3d.negotiated import Negotiated
-    neg = Negotiated(inst)
+    neg = Negotiated(inst, order=order)
     sub, _stats = neg.run()
     return sub, {v: h for v, h in neg.h_v.items() if h > 0}

@@ -100,6 +100,10 @@ def eval_losses(model, samples, device, batch_size=64):
     return {k: round(v / max(1, n), 5) for k, v in tot.items()}
 
 
+def window_txt(r):
+    return f", window {r['window']}" if r.get("window") else ""
+
+
 def make_optimizer(model, lr, wd):
     """AdamW; weight decay on weight matrices only (not biases or LayerNorm)."""
     decay, no_decay = [], []
@@ -148,7 +152,7 @@ class Trainer:
             done += 1
             norms.append(float(gn))
             for k, v in zip(tot, parts):
-                tot[k] += float(v)
+                tot[k] += float(v.detach())
         stats = {k: round(v / max(1, done), 5) for k, v in tot.items()}
         stats.update(grad_norm=round(sum(norms) / max(1, len(norms)), 4),
                      grad_norm_max=round(max(norms, default=0.0), 4),
@@ -226,7 +230,12 @@ def main(argv=None):
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--temp-moves", type=float, default=0.3,
                     help="fraction of an episode that samples moves (then greedy)")
-    ap.add_argument("--max-nets", type=int, default=80, help="skip pool instances larger than this")
+    ap.add_argument("--max-nets", type=int, default=400, help="skip pool instances larger than this")
+    ap.add_argument("--full-max-nets", type=int, default=110,
+                    help="boards with more nets than this play a --window of nets per episode "
+                         "(the rest start on their reference routes)")
+    ap.add_argument("--window", type=int, default=32, help="nets routed per episode on a large "
+                    "board (0 = always route the whole board)")
     # warm start
     ap.add_argument("--warm-episodes", type=int, default=150)
     ap.add_argument("--warm-eps", type=float, default=0.08,
@@ -313,7 +322,8 @@ def main(argv=None):
     def task(kind, **kw):
         return {"kind": kind, "data": args.data, "entry": random.choice(pool),
                 "seed": random.randrange(1 << 30), "frontier": args.frontier,
-                "rip_limit": args.rip_limit, **kw}
+                "rip_limit": args.rip_limit, "window": args.window,
+                "full_max_nets": args.full_max_nets, **kw}
 
     start_iter, step = 0, 0
     if args.resume:
@@ -364,9 +374,10 @@ def main(argv=None):
             episodes = []
             for k, r in enumerate(runner.imap(run_episode, tasks)):
                 episodes.append(unpack_samples(r["samples"]))
-                log(f"  warm {k + 1}/{args.warm_episodes} {r['instance']} eps {r['eps']:.3f}: "
+                log(f"  warm {k + 1}/{args.warm_episodes} {r['instance']} ({r['n']} nets{window_txt(r)}) "
+                    f"eps {r['eps']:.3f}: "
                     f"score {r['score']:.4f} legal {r['legal']} ({r['seconds']:.1f}s)",
-                    kind="warm", instance=r["instance"], eps=r["eps"], score=r["score"],
+                    kind="warm", instance=r["instance"], window=r["window"], eps=r["eps"], score=r["score"],
                     legal=r["legal"], seconds=r["seconds"])
             # hold out whole episodes (states within an episode are correlated)
             n_val = max(1, round(args.val_frac * len(episodes))) if len(episodes) >= 2 else 0
@@ -442,9 +453,10 @@ def main(argv=None):
                     buffer.extend(r["samples"])
                     n_new += len(r["samples"])
                     scores.append(r["score"])
-                    log(f"  iter {it} ep {len(scores) - 1}: {r['instance']} ({r['n']} nets) "
+                    log(f"  iter {it} ep {len(scores) - 1}: {r['instance']} ({r['n']} nets{window_txt(r)}) "
                         f"score {r['score']:.4f} legal {r['legal']} moves {r['moves']} ({r['seconds']:.0f}s)",
-                        kind="selfplay", iter=it, instance=r["instance"], score=r["score"],
+                        kind="selfplay", iter=it, instance=r["instance"], window=r["window"],
+                        score=r["score"],
                         legal=r["legal"], moves=r["moves"], seconds=r["seconds"])
                 if pending and not ready:
                     # workers are busy: train on the GPU meanwhile instead of idling
