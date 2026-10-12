@@ -7,6 +7,7 @@ tag changes.
 """
 from __future__ import annotations
 
+import io
 import multiprocessing as mp
 import os
 import random
@@ -43,6 +44,20 @@ def _get_model(path: str, tag, device: str, compile_: bool = False):
     return _model
 
 
+def pack_samples(samples) -> bytes:
+    """Serialise an episode's samples into one blob for the trip back to the main process.
+    Returned as tensors, torch's multiprocessing would hand each tensor over as its own
+    shared-memory mapping, and a replay buffer full of those exhausts the process's
+    mapping limit ("unable to mmap ... Cannot allocate memory")."""
+    buf = io.BytesIO()
+    torch.save(samples, buf)
+    return buf.getvalue()
+
+
+def unpack_samples(blob: bytes):
+    return torch.load(io.BytesIO(blob), weights_only=False)  # our own workers' output
+
+
 def run_episode(task: dict) -> dict:
     """task: kind ("warm" | "mcts"), data, entry, seed, frontier, rip_limit, plus
     eps (warm) or model_path, model_tag, device, sims, c_puct, temp_moves, compile (mcts)."""
@@ -56,7 +71,7 @@ def run_episode(task: dict) -> dict:
                            task.get("compile", False))
         mcts = MCTS(prob, model, task["device"], c_puct=task["c_puct"], rng=rng)
         ep = play(prob, mcts, task["sims"], train=True, temp_moves=task["temp_moves"])
-    return {"samples": label_samples(ep), "score": ep.score, "legal": ep.legal,
+    return {"samples": pack_samples(label_samples(ep)), "score": ep.score, "legal": ep.legal,
             "moves": ep.moves, "seconds": ep.seconds, "instance": task["entry"]["name"],
             "n": prob.n, "eps": task.get("eps")}
 

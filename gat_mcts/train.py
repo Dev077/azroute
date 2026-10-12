@@ -60,7 +60,7 @@ from m3d.suite import load_manifest
 
 from .data import TIER_DIRS, load_pool, tier_dir
 from .model import RouteGAT, load_checkpoint, save_checkpoint
-from .workers import Runner, run_episode, solve_case
+from .workers import Runner, run_episode, solve_case, unpack_samples
 
 VALUE_W, LEGAL_W = 1.0, 0.5   # loss = policy + VALUE_W * value + LEGAL_W * legal
 
@@ -363,7 +363,7 @@ def main(argv=None):
                      for _ in range(args.warm_episodes)]
             episodes = []
             for k, r in enumerate(runner.imap(run_episode, tasks)):
-                episodes.append(r["samples"])
+                episodes.append(unpack_samples(r["samples"]))
                 log(f"  warm {k + 1}/{args.warm_episodes} {r['instance']} eps {r['eps']:.3f}: "
                     f"score {r['score']:.4f} legal {r['legal']} ({r['seconds']:.1f}s)",
                     kind="warm", instance=r["instance"], eps=r["eps"], score=r["score"],
@@ -428,6 +428,7 @@ def main(argv=None):
                     pending.remove(h)
                     try:
                         r = h.get()
+                        r["samples"] = unpack_samples(r["samples"])
                     except Exception as exc:  # one broken episode shouldn't end the run
                         failed += 1
                         log(f"  iter {it}: an episode crashed and was skipped ({type(exc).__name__}: {exc})")
