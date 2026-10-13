@@ -112,14 +112,19 @@ def main(argv=None) -> None:
         if os.path.exists(os.path.join(work, f)):
             os.remove(os.path.join(work, f))
     prev_cfg_path = os.path.join(work, "run_config.json")
-    prev_deadline = None
+    prev_cfg = {}
     if a.hours is None and os.path.exists(prev_cfg_path):
-        prev_deadline = json.load(open(prev_cfg_path)).get("deadline_epoch")
+        prev_cfg = json.load(open(prev_cfg_path))
+    prev_deadline = prev_cfg.get("deadline_epoch")
     if prev_deadline and prev_deadline > time.time():
         deadline = prev_deadline
+        # keeps the LR schedule's position; configs from before start_epoch was stored rebuild it
+        start_epoch = prev_cfg.get("start_epoch") or (
+            deadline - (prev_cfg.get("hours") or 23.5) * 3600 + prev_cfg.get("export_minutes", 20.0) * 60)
         log(f"keeping the original deadline: {(deadline - time.time()) / 3600:.2f} h left")
     else:
-        deadline = time.time() + (a.hours or 23.5) * 3600 - a.export_minutes * 60
+        start_epoch = time.time()
+        deadline = start_epoch + (a.hours or 23.5) * 3600 - a.export_minutes * 60
 
     tiers = list(TIER_DIRS) if a.tiers == "all" else a.tiers.split(",")
     cases = [f"{t}/{n}" for (t, n, _p, _b) in all_cases() if t in tiers]
@@ -151,7 +156,7 @@ def main(argv=None) -> None:
            "concurrency": C, "cache_cases": max(2, C + 1), "stall_tries": 200, "greedy_seconds": 15.0,
            "min_excess": 0.003, "max_search": 64 if not a.smoke else 3, "n_full": a.n_full,
            "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": 1.0, "k_min": 3, "k_max": 8}
-    run_cfg = dict(vars(a), deadline_epoch=deadline, workers=W, concurrency=C, batch=batch, buffer=cap, device=str(device),
+    run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C, batch=batch, buffer=cap, device=str(device),
                    cases=len(cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
                    cpus=os.cpu_count())
     json.dump(run_cfg, open(os.path.join(work, "run_config.json"), "w"), indent=1)
@@ -177,6 +182,7 @@ def main(argv=None) -> None:
     rng = np.random.default_rng(a.seed)
     records_in = 0
     net_ready = trainer.steps >= a.warmup_steps
+    steps0 = trainer.steps      # the replay buffer is not checkpointed: the replay ratio counts this session only
 
     ready_flag = os.path.join(work, "net_ready")
 
@@ -298,7 +304,7 @@ def main(argv=None) -> None:
         torch.save(trainer.state_dict(), learner_path + ".tmp")
         os.replace(learner_path + ".tmp", learner_path)
 
-    t_start = time.time()
+    t_start = start_epoch
     while True:
         now = time.time()
         if not stopping and (now >= deadline or os.path.exists(cfg["stop_flag"])):
@@ -314,7 +320,7 @@ def main(argv=None) -> None:
         if stopping and (exited >= W or time.time() > deadline + a.export_minutes * 30):
             break
         ingest()
-        can_train = buf.n >= a.min_records and trainer.steps * batch < a.replay_ratio * records_in
+        can_train = buf.n >= a.min_records and (trainer.steps - steps0) * batch < a.replay_ratio * records_in
         if can_train and not stopping:
             t0 = time.time()
             progress = (now - t_start) / max(1.0, deadline - t_start)
