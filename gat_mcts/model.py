@@ -1,6 +1,6 @@
-"""Heterogeneous GATv2 with a policy head (one logit per candidate route) and a
-value head (predicted challenge score of the finished routing, plus the
-probability that it finishes legally)."""
+"""Heterogeneous GATv2 with a policy head (one logit per kick on offer) and a
+value head (how much better, in percent, the best board reachable from here in
+the moves left is than the current one)."""
 from __future__ import annotations
 
 import torch
@@ -39,7 +39,7 @@ class RouteGAT(nn.Module):
                 for et in EDGE_TYPES}, aggr="sum"))
             self.norms.append(nn.ModuleDict({t: nn.LayerNorm(hidden) for t in NODE_DIMS}))
         self.policy = _mlp(2 * hidden, hidden, 1)
-        self.value = _mlp(4 * hidden + G_DIM, hidden, 2)  # [score, legal logit]
+        self.value = _mlp(4 * hidden + G_DIM, hidden, 1)  # gain still to come, %
         self.compiled = False
         self._core_fn = self._core
 
@@ -69,7 +69,7 @@ class RouteGAT(nn.Module):
                                                            device=g.device)
         of = data["cand", "of", "net"].edge_index
         logits, v = self._core_fn(x, ei, ea, of, g, batch["net"], batch["region"], batch["cand"])
-        return logits, v[:, 0], v[:, 1], batch["cand"]
+        return logits, v[:, 0], batch["cand"]
 
     def _core(self, x_in, ei, ea, of, g, b_net, b_region, b_cand):
         x = {t: F.gelu(self.proj[t](x_in[t])) for t in NODE_DIMS}
@@ -95,13 +95,13 @@ class RouteGAT(nn.Module):
 
     @torch.no_grad()
     def evaluate(self, data, device):
-        """Single state -> (prior over candidates, predicted score, P(legal))."""
+        """Single state -> (prior over the moves, predicted gain still to come in %)."""
         self.eval()
         if str(device) != "cpu":
             data = data.clone().to(device)  # keep the cached CPU graph on the CPU
-        logits, value, legal, cb = self(data)
-        prior = segment_softmax(logits, cb).cpu().tolist()
-        return prior, max(0.0, float(value[0])), float(torch.sigmoid(legal[0]))
+        logits, value, cb = self(data)
+        policy = segment_softmax(logits, cb).cpu().tolist()
+        return policy, float(value[0])
 
 
 def save_checkpoint(path, model, optimizer=None, extra=None):

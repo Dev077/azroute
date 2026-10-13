@@ -9,11 +9,10 @@ Each instance is drawn from one of the benchmark tiers' recipes (``--mix``):
 with the tier's own generator settings (m3d/suite.py) but a different master
 seed, so the benchmarks are never trained on. Each gets the baseline total the
 challenge would use (the tier's own baseline router) and that baseline's solution
-as the reference routes (the ref candidates, and the routes the rest of a large
-board keeps in a windowed episode). For the negotiated tiers that is the
-negotiated solution plus its history costs (the spt_hist candidates), from a
-single negotiated run; for scale it is the simple router's solution, with no
-history (running the negotiated router there would cost minutes per board).
+as the reference routing (an episode's start, after cleanup). For the negotiated
+tiers that is the negotiated solution (saved with its history costs, unused by
+the kick search), from a single negotiated run; for scale it is the simple
+router's solution (running the negotiated router there would cost minutes per board).
 
     python -m gat_mcts.gen_data --out gat_mcts_data/train --n 200 --workers 2
     python -m gat_mcts.gen_data --out pool --n 2000 --mix hard=0.4,congested=0.1,scale=0.5

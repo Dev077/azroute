@@ -3,7 +3,8 @@
 A pool directory holds, per instance:
   <name>.json           the instance (m3d-instance)
   <name>.ref.sol.json   the negotiated router's legal solution
-  <name>.hist.json      the negotiated router's per-vertex history costs
+  <name>.hist.json      the negotiated router's per-vertex history costs (not used
+                        by the kick search; kept so older pools stay valid)
 and index.json listing {name, baseline_total, tier, side, n_nets}.
 """
 from __future__ import annotations
@@ -51,15 +52,15 @@ def load_pool(pool_dir: str):
 def pool_problem(pool_dir: str, entry: Dict, **kw) -> Problem:
     prefix = os.path.join(pool_dir, entry["name"])
     inst = Instance.load(prefix + ".json")
-    ref, hist = load_negotiated(prefix)
-    return Problem(inst, entry["baseline_total"], reference=ref, history=hist, **kw)
+    ref, _hist = load_negotiated(prefix)
+    return Problem(inst, entry["baseline_total"], reference=ref, **kw)
 
 
 def benchmark_problem(suite_dir: str, case: Dict, cache_dir: Optional[str] = None,
                       **kw) -> Tuple[Problem, float]:
-    """Problem for a benchmark case. Runs the negotiated router (the ref routes and
-    history costs) unless ``cache_dir`` already holds its result; returns the
-    seconds spent on it so it can be counted in the reported runtime."""
+    """Problem for a benchmark case. Runs the negotiated router (its solution is
+    where the search starts) unless ``cache_dir`` already holds its result;
+    returns the seconds spent on it so it can be counted in the reported runtime."""
     inst = Instance.load(os.path.join(suite_dir, case["instance_file"]))
     t0 = time.time()
     got = None
@@ -75,4 +76,4 @@ def benchmark_problem(suite_dir: str, case: Dict, cache_dir: Optional[str] = Non
     else:
         ref, hist = got
     secs = time.time() - t0
-    return Problem(inst, case["baseline_total"], reference=ref, history=hist, **kw), secs
+    return Problem(inst, case["baseline_total"], reference=ref, **kw), secs

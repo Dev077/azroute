@@ -1,5 +1,5 @@
 """Units of work that run in parallel worker processes (or in-process with
-``--workers 1``): one training episode, or solving one benchmark case.
+``--workers 1``): one self-play episode, or solving one benchmark case.
 
 Workers are started with the "spawn" method (safe with CUDA). The network is
 handed over as a checkpoint path plus a tag; a worker reloads it only when the
@@ -18,7 +18,8 @@ import torch
 from .data import benchmark_problem, pool_problem
 from .mcts import MCTS
 from .model import RouteGAT
-from .selfplay import label_samples, play, play_guided, solve, window_state
+from .problem import Board, nets_around, window_nets
+from .selfplay import label_samples, play, solve, start_state
 
 _model = None
 _model_tag = None
@@ -59,49 +60,51 @@ def unpack_samples(blob: bytes):
 
 
 def run_episode(task: dict) -> dict:
-    """task: kind ("warm" | "mcts"), data, entry, seed, frontier, rip_limit, window,
-    full_max_nets, plus eps (warm) or model_path, model_tag, device, sims, c_puct,
-    temp_moves, compile (mcts). Boards with more than full_max_nets nets play a
-    window of that many nets (window_state); the rest start on their reference routes."""
+    """task: data, entry, seed, moves, settle, start_seconds, window, full_max_nets,
+    sims, c_puct, temp_moves, model_path, model_tag, device, compile.
+
+    One self-play episode: load a pool board, clean it up, and play ``moves``
+    kicks chosen by MCTS guided by the network. Boards with more than
+    full_max_nets nets kick only a window of that many nets (the start's cleanup
+    covers those and the nets around them)."""
+    t0 = time.time()
     rng = random.Random(task["seed"])
-    prob = pool_problem(task["data"], task["entry"], frontier=task["frontier"],
-                        rip_limit=task["rip_limit"], seed=task["seed"])
-    start = None
+    prob = pool_problem(task["data"], task["entry"])
+    nets = None
     if task.get("window") and prob.n > task.get("full_max_nets", 0):
-        start = window_state(prob, task["window"], rng)
-    window = len(start.unrouted) if start is not None else None
-    if task["kind"] == "warm":
-        ep = play_guided(prob, task["eps"], rng, start=start)
-    else:
-        model = _get_model(task["model_path"], task["model_tag"], task["device"],
-                           task.get("compile", False))
-        mcts = MCTS(prob, model, task["device"], c_puct=task["c_puct"], rng=rng)
-        ep = play(prob, mcts, task["sims"], train=True, temp_moves=task["temp_moves"],
-                  start=start)
-    return {"samples": pack_samples(label_samples(ep)), "score": ep.score, "legal": ep.legal,
-            "moves": ep.moves, "seconds": ep.seconds, "instance": task["entry"]["name"],
-            "n": prob.n, "window": window, "eps": task.get("eps")}
+        nets = window_nets(prob, task["window"], rng)
+    around = nets_around(prob, nets) if nets is not None else None
+    board = Board(prob, start_state(prob, task["start_seconds"], around), task["moves"],
+                  task["settle"], nets)
+    model = _get_model(task["model_path"], task["model_tag"], task["device"],
+                       task.get("compile", False))
+    mcts = MCTS(board, model, task["device"], c_puct=task["c_puct"], rng=rng)
+    ep = play(board, mcts, task["sims"], train=True, temp_moves=task["temp_moves"])
+    return {"samples": pack_samples(label_samples(ep)), "score": ep.best_score,
+            "start": ep.start_score, "gain": ep.gain, "moves": ep.moves,
+            "seconds": time.time() - t0, "instance": task["entry"]["name"], "n": prob.n,
+            "window": len(nets) if nets is not None else None}
 
 
 def solve_case(task: dict) -> dict:
-    """task: suite_dir, case, cache_dir, model_path (None for rollout), model_tag,
-    device, evaluator, sims, c_puct, frontier, rip_limit, cleanup_seconds, out (or None),
-    compile (optional)."""
+    """task: suite_dir, case, cache_dir, model_path (None for heuristic), model_tag,
+    device, evaluator, sims, moves, rounds, settle, c_puct, window, full_max_nets,
+    cleanup_seconds, out (or None), compile (optional)."""
     t0 = time.time()
-    prob, _neg_s = benchmark_problem(task["suite_dir"], task["case"], cache_dir=task.get("cache_dir"),
-                                     frontier=task["frontier"], rip_limit=task["rip_limit"])
+    prob, _neg_s = benchmark_problem(task["suite_dir"], task["case"], cache_dir=task.get("cache_dir"))
     model = None
     if task["evaluator"] == "net":
         model = _get_model(task["model_path"], task["model_tag"], task["device"],
                            task.get("compile", False))
-    mcts = MCTS(prob, model, task["device"], c_puct=task["c_puct"],
-                evaluator=task["evaluator"], rng=random.Random(0))
-    sol = solve(prob, mcts, task["sims"], cleanup_seconds=task["cleanup_seconds"])
+    sol = solve(prob, model, task["device"], task["sims"], task["moves"], task["rounds"],
+                c_puct=task["c_puct"], evaluator=task["evaluator"], settle_budget=task["settle"],
+                window=task["window"], full_max_nets=task["full_max_nets"],
+                cleanup_seconds=task["cleanup_seconds"])
     if task.get("out"):
         sol.submission.save(os.path.join(task["out"], f"{prob.inst.name}.sol.json"))
-    return {"case": prob.inst.name, "n": prob.n,
-            "search": prob.score(sol.delay_search) if sol.delay_search else 0.0,
-            "final": prob.score(sol.delay_final), "path": sol.path,
+    return {"case": prob.inst.name, "n": prob.n, "start": prob.score(sol.delay_start),
+            "search": prob.score(sol.delay_search), "final": prob.score(sol.delay_final),
+            "rounds": sol.rounds,
             "seconds": round(time.time() - t0, 2)}  # wall clock incl. the negotiated router
 
 

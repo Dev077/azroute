@@ -1,21 +1,23 @@
-"""Train the GAT policy/value network: a warm start, then AlphaZero-style self-play.
+"""Train the GAT policy/value network with AlphaZero-style self-play over kicks.
 
     python -m gat_mcts.train --data gat_mcts_data/train --out runs/gat_mcts --max-hours 4
 
-1. Warm start (skipped on --resume): episodes without search that follow the
-   negotiated route for each net but deviate at random with probability eps. The
-   policy learns to imitate the legal teacher; the value head learns, from the
-   real challenge score of each perturbed episode, which deviations fail (0) and
-   which beat the baseline (> 1). A held-out set of episodes gives early stopping.
-2. Self-play: every iteration plays --episodes MCTS episodes on random pool
-   instances (spread over --workers processes), measures the loss on those new,
-   unseen states, adds them to the replay buffer, and trains on it. With
-   --workers > 1 the GPU trains *while* the workers play (not after), so neither
-   waits for the other; the number of gradient steps is the same either way.
+Every episode starts from a pool instance's reference routing after the
+cleanup pass and plays --moves kicks (problem.py), each chosen by MCTS guided
+by the network; its result is the best board it reached. There is no warm
+start: the search explores from the first iteration (Dirichlet noise at the
+root, moves sampled from the visit counts early in each episode), and because
+every board in the tree is scored exactly it finds improvements even while
+the network is still untrained.
 
-Losses: policy cross-entropy to the visit distribution, MSE of the value head
-to the episode's challenge score (baseline_total / total_delay, 0 if it failed),
-and BCE of the legal head.
+Every iteration plays --episodes episodes on random pool instances (spread over
+--workers processes), measures the loss on those new, unseen states, adds them
+to the replay buffer, and trains on it. With --workers > 1 the GPU trains
+*while* the workers play (not after), so neither waits for the other.
+
+Losses: policy cross-entropy to the search's visit distribution, and MSE of the
+value head to the gain still to come: how much better (in %) the best board
+from that point on was than the board at that point.
 
 Training stability:
   * exploding gradients: gradient-norm clipping; any step with a non-finite loss
@@ -24,21 +26,20 @@ Training stability:
   * vanishing gradients: residual + LayerNorm layers (model.py), a numerically
     stable log-softmax for the policy, learning-rate warmup
   * overfitting: dropout, decoupled weight decay (not on biases / norms), a cap
-    on passes over the replay buffer per iteration, early stopping on held-out
-    episodes in the warm start, a loss on unseen episodes every iteration, and
-    best.pt (best evaluation score) kept separately from latest.pt
+    on passes over the replay buffer per iteration, a loss on unseen episodes
+    every iteration, and best.pt (best evaluation score) kept separately
   * smooth end of training: cosine learning-rate decay over --max-hours (constant
     learning rate after warmup when there is no hour limit)
 
 Stops at --iters, when --max-hours would be exceeded, or (with --plateau-evals)
 when the evaluation score hasn't improved for that many evaluations, always
-leaving a checkpoint (latest.pt) and a JSON-lines log in --out. Each iteration
-logs GPU utilisation (sampled from nvidia-smi) and samples generated per hour.
+leaving a checkpoint (latest.pt) and a JSON-lines log in --out. A fresh run
+first logs the same evaluation done by the search without a network: the bar
+the network has to beat.
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import itertools
 import json
 import math
@@ -62,11 +63,11 @@ from .data import TIER_DIRS, load_pool, tier_dir
 from .model import RouteGAT, load_checkpoint, save_checkpoint
 from .workers import Runner, run_episode, solve_case, unpack_samples
 
-VALUE_W, LEGAL_W = 1.0, 0.5   # loss = policy + VALUE_W * value + LEGAL_W * legal
+VALUE_W = 1.0   # loss = policy + VALUE_W * value
 
 
 def segment_log_softmax(logits, seg):
-    """log-softmax within each graph's candidates (stable: no log of a clamped prob,
+    """log-softmax within each graph's moves (stable: no log of a clamped prob,
     so tiny probabilities still get gradient)."""
     n = int(seg.max()) + 1 if seg.numel() else 0
     m = scatter(logits.detach(), seg, dim=0, dim_size=n, reduce="max")
@@ -77,19 +78,18 @@ def segment_log_softmax(logits, seg):
 
 def batch_losses(model, samples, device):
     batch = Batch.from_data_list(samples).to(device)
-    logits, value, legal_logit, cb = model(batch)
+    logits, value, cb = model(batch)
     B = batch.g.size(0)
     l_pol = -(batch["cand"].pi * segment_log_softmax(logits, cb)).sum() / B
     l_val = F.mse_loss(value, batch.z)
-    l_leg = F.binary_cross_entropy_with_logits(legal_logit, batch.legal)
-    return l_pol + VALUE_W * l_val + LEGAL_W * l_leg, l_pol, l_val, l_leg
+    return l_pol + VALUE_W * l_val, l_pol, l_val
 
 
 @torch.no_grad()
 def eval_losses(model, samples, device, batch_size=64):
     """Mean losses on ``samples`` without training (dropout off)."""
     model.eval()
-    tot = {"loss": 0.0, "policy": 0.0, "value": 0.0, "legal": 0.0}
+    tot = {"loss": 0.0, "policy": 0.0, "value": 0.0}
     n = 0
     for i in range(0, len(samples), batch_size):
         chunk = samples[i:i + batch_size]
@@ -114,11 +114,10 @@ def make_optimizer(model, lr, wd):
 
 
 class Trainer:
-    def __init__(self, model, opt, args, frac_fn, step=0, log=print):
+    def __init__(self, model, opt, args, frac_fn, step=0):
         self.model, self.opt, self.args = model, opt, args
         self.frac_fn = frac_fn      # fraction of the time budget used (for the LR decay)
         self.step = step            # global gradient step, kept across resumes
-        self.log = log
 
     def lr(self):
         a = self.args
@@ -130,7 +129,7 @@ class Trainer:
     def train(self, buffer, steps):
         a, model, opt = self.args, self.model, self.opt
         model.train()
-        tot = {"loss": 0.0, "policy": 0.0, "value": 0.0, "legal": 0.0}
+        tot = {"loss": 0.0, "policy": 0.0, "value": 0.0}
         norms, skipped, done = [], 0, 0
         for _ in range(steps):
             lr = self.lr()
@@ -199,11 +198,11 @@ def merge_stats(parts):
     """Combine Trainer.train() stats from several chunks (weighted by steps)."""
     parts = [(n, st) for n, st in parts if n > 0]
     if not parts:
-        return {"loss": 0.0, "policy": 0.0, "value": 0.0, "legal": 0.0, "grad_norm": 0.0,
+        return {"loss": 0.0, "policy": 0.0, "value": 0.0, "grad_norm": 0.0,
                 "grad_norm_max": 0.0, "skipped": 0, "lr": 0.0}
     tot = sum(n for n, _ in parts)
     out = {k: round(sum(n * st[k] for n, st in parts) / tot, 5)
-           for k in ("loss", "policy", "value", "legal", "grad_norm")}
+           for k in ("loss", "policy", "value", "grad_norm")}
     out["grad_norm_max"] = max(st["grad_norm_max"] for _, st in parts)
     out["skipped"] = sum(st["skipped"] for _, st in parts)
     out["lr"] = parts[-1][1]["lr"]
@@ -214,48 +213,43 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--data", default="gat_mcts_data/train", help="pool from gat_mcts.gen_data")
     ap.add_argument("--out", default="runs/gat_mcts", help="checkpoints + log (e.g. on Google Drive)")
-    ap.add_argument("--resume", default=None, help="checkpoint to resume from (skips warm start)")
+    ap.add_argument("--resume", default=None, help="checkpoint to resume from")
     ap.add_argument("--max-hours", type=float, default=0.0,
                     help="training budget in hours, summed over every session of this --out "
                          "(resumes included); stops before an iteration would exceed it (0 = none)")
-    # model (defaults: ~3.0M parameters; hidden must be divisible by heads)
+    # model (defaults: ~3.3M parameters; hidden must be divisible by heads)
     ap.add_argument("--hidden", type=int, default=152)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--dropout", type=float, default=0.1)
     # environment / search
-    ap.add_argument("--frontier", type=int, default=4, help="nets MCTS may choose between")
-    ap.add_argument("--rip-limit", type=int, default=8)
-    ap.add_argument("--sims", type=int, default=16, help="MCTS simulations per move")
+    ap.add_argument("--moves", type=int, default=16, help="kicks per episode")
+    ap.add_argument("--settle", type=int, default=40,
+                    help="reroutes tried around the freed space after each kick")
+    ap.add_argument("--start-seconds", type=float, default=30.0,
+                    help="cleanup time on the reference routing before an episode starts")
+    ap.add_argument("--sims", type=int, default=32, help="MCTS simulations per move")
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--temp-moves", type=float, default=0.3,
                     help="fraction of an episode that samples moves (then greedy)")
     ap.add_argument("--max-nets", type=int, default=400, help="skip pool instances larger than this")
     ap.add_argument("--full-max-nets", type=int, default=110,
-                    help="boards with more nets than this play a --window of nets per episode "
-                         "(the rest start on their reference routes)")
-    ap.add_argument("--window", type=int, default=32, help="nets routed per episode on a large "
-                    "board (0 = always route the whole board)")
-    # warm start
-    ap.add_argument("--warm-episodes", type=int, default=150)
-    ap.add_argument("--warm-eps", type=float, default=0.08,
-                    help="max random-deviation rate in warm-start episodes")
-    ap.add_argument("--warm-steps", type=int, default=1500, help="maximum; early stopping may end sooner")
-    ap.add_argument("--val-frac", type=float, default=0.1, help="warm-start episodes held out")
-    ap.add_argument("--patience", type=int, default=3,
-                    help="warm start stops after this many checks (every 100 steps) without improvement")
+                    help="boards with more nets than this kick only a --window of nets per episode")
+    ap.add_argument("--window", type=int, default=32, help="nets that may be kicked in an episode "
+                    "on a large board (0 = always the whole board)")
     # self-play
     ap.add_argument("--iters", type=int, default=1000, help="self-play iterations (0 = no limit)")
     ap.add_argument("--episodes", type=int, default=6, help="self-play episodes per iteration")
-    ap.add_argument("--train-steps", type=int, default=150,
+    ap.add_argument("--train-steps", type=int, default=40,
                     help="gradient steps per iteration (capped at --max-passes over the buffer)")
     ap.add_argument("--max-passes", type=float, default=4.0,
                     help="cap: samples seen per iteration <= this x buffer size")
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--buffer", type=int, default=15000, help="replay buffer size (~150 KB/sample)")
+    ap.add_argument("--buffer", type=int, default=15000,
+                    help="replay buffer size (~250-550 KB of RAM per sample on hard-tier boards)")
     # optimisation
     ap.add_argument("--lr", type=float, default=3e-4, help="peak learning rate")
-    ap.add_argument("--warmup-steps", type=int, default=1000)
+    ap.add_argument("--warmup-steps", type=int, default=200)
     ap.add_argument("--min-lr-frac", type=float, default=0.1,
                     help="learning rate decays (cosine, over --max-hours) to this fraction of --lr; "
                          "without --max-hours it stays at --lr")
@@ -265,7 +259,8 @@ def main(argv=None):
     ap.add_argument("--eval-tier", default="hard", choices=list(TIER_DIRS))
     ap.add_argument("--eval-every", type=int, default=10, help="iterations (0 = never)")
     ap.add_argument("--eval-cases", type=int, default=2)
-    ap.add_argument("--eval-sims", type=int, default=16)
+    ap.add_argument("--eval-sims", type=int, default=32)
+    ap.add_argument("--eval-rounds", type=int, default=1, help="episodes of --moves kicks per case")
     ap.add_argument("--eval-cleanup", type=float, default=10.0, help="cleanup seconds per case")
     ap.add_argument("--plateau-evals", type=int, default=0,
                     help="stop when the eval search score hasn't improved for this many "
@@ -316,13 +311,17 @@ def main(argv=None):
     pool = [e for e in load_pool(args.data) if e["n_nets"] <= args.max_nets]
     if not pool:
         raise SystemExit(f"no instances with <= {args.max_nets} nets in {args.data}")
-    log(f"pool: {len(pool)} instances from {args.data}; train device {args.device}, "
+    tiers = {}
+    for e in pool:
+        tiers[e.get("tier", "?")] = tiers.get(e.get("tier", "?"), 0) + 1
+    log(f"pool: {len(pool)} instances from {args.data} "
+        f"({', '.join(f'{t} {n}' for t, n in sorted(tiers.items()))}); train device {args.device}, "
         f"self-play device {args.selfplay_device}, {args.workers} worker(s)")
 
-    def task(kind, **kw):
-        return {"kind": kind, "data": args.data, "entry": random.choice(pool),
-                "seed": random.randrange(1 << 30), "frontier": args.frontier,
-                "rip_limit": args.rip_limit, "window": args.window,
+    def task(**kw):
+        return {"data": args.data, "entry": random.choice(pool),
+                "seed": random.randrange(1 << 30), "moves": args.moves, "settle": args.settle,
+                "start_seconds": args.start_seconds, "window": args.window,
                 "full_max_nets": args.full_max_nets, **kw}
 
     start_iter, step = 0, 0
@@ -344,7 +343,7 @@ def main(argv=None):
         model.set_compiled(True)
     log(f"model: {sum(p.numel() for p in model.parameters()):,} parameters, config {model.config}, "
         f"torch.compile {'on' if args.compile else 'off'}")
-    trainer = Trainer(model, opt, args, lambda: spent() / budget, step, log=log)
+    trainer = Trainer(model, opt, args, lambda: spent() / budget, step)
     best_search, best_iter, evals_since_best = -1.0, None, 0
     if args.resume and os.path.exists(best_path):
         with open(best_path) as fh:
@@ -362,57 +361,30 @@ def main(argv=None):
     def checkpoint(path, it):
         save_checkpoint(path, model, opt, {"iter": it, "step": trainer.step})
 
+    def eval_tasks(evaluator, tag):
+        suite_dir = tier_dir(args.eval_tier)
+        cases = load_manifest(suite_dir)["cases"][:args.eval_cases]
+        return [{"suite_dir": suite_dir, "case": c,
+                 "cache_dir": os.path.join(args.out, "negotiated_cache"),
+                 "model_path": actor_path if evaluator == "net" else None, "model_tag": tag,
+                 "device": args.selfplay_device, "evaluator": evaluator,
+                 "sims": args.eval_sims, "moves": args.moves, "rounds": args.eval_rounds,
+                 "settle": args.settle, "c_puct": args.c_puct, "window": args.window,
+                 "full_max_nets": args.full_max_nets,
+                 "cleanup_seconds": args.eval_cleanup, "out": None,
+                 "compile": args.compile} for c in cases]
+
     buffer = deque(maxlen=args.buffer)
     runner = Runner(args.workers)
     try:
-        # ---- 1. warm start ----------------------------------------------------
-        if not args.resume and args.warm_episodes > 0:
-            log(f"warm start: {args.warm_episodes} guided episodes")
-            t0 = time.time()
-            tasks = [task("warm", eps=random.uniform(0.0, args.warm_eps))
-                     for _ in range(args.warm_episodes)]
-            episodes = []
-            for k, r in enumerate(runner.imap(run_episode, tasks)):
-                episodes.append(unpack_samples(r["samples"]))
-                log(f"  warm {k + 1}/{args.warm_episodes} {r['instance']} ({r['n']} nets{window_txt(r)}) "
-                    f"eps {r['eps']:.3f}: "
-                    f"score {r['score']:.4f} legal {r['legal']} ({r['seconds']:.1f}s)",
-                    kind="warm", instance=r["instance"], window=r["window"], eps=r["eps"], score=r["score"],
-                    legal=r["legal"], seconds=r["seconds"])
-            # hold out whole episodes (states within an episode are correlated)
-            n_val = max(1, round(args.val_frac * len(episodes))) if len(episodes) >= 2 else 0
-            val = [s for ep in episodes[:n_val] for s in ep]
-            for ep in episodes[n_val:]:
-                buffer.extend(ep)
-            best_val, best_state, bad, done = math.inf, None, 0, 0
-            train_list = list(buffer)
-            while done < args.warm_steps:
-                n = min(100, args.warm_steps - done)
-                stats = trainer.train(train_list, n)
-                done += n
-                if not val:
-                    continue
-                v = eval_losses(model, val, args.device)
-                log(f"  warm step {done}: train {stats['loss']:.4f}  held-out {v['loss']:.4f}  "
-                    f"(grad norm {stats['grad_norm']:.3f}, lr {stats['lr']:.2e})",
-                    kind="warm_val", step=done, train=stats, val=v)
-                if v["loss"] < best_val - 1e-4:
-                    best_val, best_state, bad = v["loss"], copy.deepcopy(model.state_dict()), 0
-                else:
-                    bad += 1
-                    if bad >= args.patience:
-                        log(f"  warm start: held-out loss stopped improving, stopping at step {done}")
-                        break
-            if best_state is not None:
-                model.load_state_dict(best_state)
-            buffer.extend(val)  # held-out states join the replay buffer afterwards
-            log(f"warm start done in {time.time() - t0:.0f}s, best held-out loss {best_val:.4f}",
-                kind="warm_train", best_val=best_val, steps=done)
-            checkpoint(os.path.join(args.out, "warm.pt"), -1)
-            checkpoint(os.path.join(args.out, "latest.pt"), -1)
-            record_spent()
+        if not args.resume and args.eval_every:
+            res = sorted(runner.imap(solve_case, eval_tasks("heuristic", "heuristic")),
+                         key=lambda r: r["case"])
+            log(f"eval {args.eval_tier}, search without a network (the bar to beat): " + ", ".join(
+                f"{r['case']} start {r['start']:.4f} search {r['search']:.4f}" for r in res)
+                + f"; mean search {sum(r['search'] for r in res) / len(res):.4f}",
+                kind="eval_heuristic", cases=res)
 
-        # ---- 2. self-play -----------------------------------------------------
         last_iter_s = 0.0
         for it in (range(start_iter, args.iters) if args.iters > 0 else itertools.count(start_iter)):
             if spent() + 1.2 * last_iter_s > budget:
@@ -421,12 +393,12 @@ def main(argv=None):
                 break
             t0 = time.time()
             save_actor()
-            tasks = [task("mcts", model_path=actor_path, model_tag=it, device=args.selfplay_device,
+            tasks = [task(model_path=actor_path, model_tag=it, device=args.selfplay_device,
                           sims=args.sims, c_puct=args.c_puct, temp_moves=args.temp_moves,
                           compile=args.compile)
                      for _ in range(args.episodes)]
             pending = [runner.submit(run_episode, t) for t in tasks]
-            scores, n_new, failed = [], 0, 0
+            scores, gains, n_new, failed = [], [], 0, 0
             fresh_sum, fresh_n = {}, 0
             chunks, done_steps = [], 0
 
@@ -453,11 +425,13 @@ def main(argv=None):
                     buffer.extend(r["samples"])
                     n_new += len(r["samples"])
                     scores.append(r["score"])
+                    gains.append(r["gain"])
                     log(f"  iter {it} ep {len(scores) - 1}: {r['instance']} ({r['n']} nets{window_txt(r)}) "
-                        f"score {r['score']:.4f} legal {r['legal']} moves {r['moves']} ({r['seconds']:.0f}s)",
+                        f"start {r['start']:.4f} best {r['score']:.4f} ({r['gain']:+.2f}%) "
+                        f"moves {r['moves']} ({r['seconds']:.0f}s)",
                         kind="selfplay", iter=it, instance=r["instance"], window=r["window"],
-                        score=r["score"],
-                        legal=r["legal"], moves=r["moves"], seconds=r["seconds"])
+                        score=r["score"], start=r["start"], gain=r["gain"],
+                        moves=r["moves"], seconds=r["seconds"])
                 if pending and not ready:
                     # workers are busy: train on the GPU meanwhile instead of idling
                     n = min(10, step_cap() - done_steps)
@@ -486,16 +460,18 @@ def main(argv=None):
                 except (ValueError, TypeError):
                     pass
             mean = sum(scores) / len(scores)
+            mean_gain = sum(gains) / len(gains)
             last_iter_s = time.time() - t0
             per_hour = round(n_new * 3600 / last_iter_s)
             g = gpu.take() or {}
             gap = f", unseen-data loss {fresh['loss']:.4f}" if fresh else ""
             gtxt = f", GPU {g['gpu_util']:.0f}% / {g['gpu_mem_mb'] / 1024:.1f} GB" if g else ""
-            log(f"iter {it}: mean self-play score {mean:.4f}, train loss {stats['loss']:.4f}{gap}, "
+            log(f"iter {it}: mean self-play score {mean:.4f} (gain {mean_gain:+.2f}% over cleanup), "
+                f"train loss {stats['loss']:.4f}{gap}, "
                 f"grad norm {stats['grad_norm']:.3f}, lr {stats['lr']:.2e}, buffer {len(buffer)}, "
                 f"{steps} steps ({overlapped} during self-play), {per_hour} samples/h{gtxt}, {last_iter_s:.0f}s "
                 f"(total {spent() / 3600:.2f} h)",
-                kind="iter", iter=it, mean_score=mean, buffer=len(buffer), steps=steps,
+                kind="iter", iter=it, mean_score=mean, mean_gain=mean_gain, buffer=len(buffer), steps=steps,
                 seconds=last_iter_s, fresh=fresh, samples=n_new, samples_per_hour=per_hour,
                 steps_during_selfplay=overlapped,
                 **g, **stats)
@@ -506,22 +482,14 @@ def main(argv=None):
                 t1 = time.time()
                 checkpoint(os.path.join(args.out, f"iter_{it:04d}.pt"), it)
                 save_actor()
-                suite_dir = tier_dir(args.eval_tier)
-                cases = load_manifest(suite_dir)["cases"][:args.eval_cases]
-                etasks = [{"suite_dir": suite_dir, "case": c,
-                           "cache_dir": os.path.join(args.out, "negotiated_cache"),
-                           "model_path": actor_path, "model_tag": f"eval{it}",
-                           "device": args.selfplay_device, "evaluator": "net",
-                           "sims": args.eval_sims, "c_puct": args.c_puct,
-                           "frontier": args.frontier, "rip_limit": args.rip_limit,
-                           "cleanup_seconds": args.eval_cleanup, "out": None,
-                           "compile": args.compile} for c in cases]
-                res = sorted(runner.imap(solve_case, etasks), key=lambda r: r["case"])
+                res = sorted(runner.imap(solve_case, eval_tasks("net", f"eval{it}")),
+                             key=lambda r: r["case"])
                 for r in res:
-                    log(f"    eval {r['case']}: search {r['search']:.4f}  final {r['final']:.4f}  "
-                        f"({r['path']}, {r['seconds']:.0f}s)")
+                    log(f"    eval {r['case']}: start {r['start']:.4f}  search {r['search']:.4f}  "
+                        f"final {r['final']:.4f}  ({r['seconds']:.0f}s)")
                 mean_search = sum(r["search"] for r in res) / len(res)
                 log(f"  eval {args.eval_tier}: mean search {mean_search:.4f} "
+                    f"(start {sum(r['start'] for r in res) / len(res):.4f}) "
                     f"final {sum(r['final'] for r in res) / len(res):.4f}",
                     kind="eval", iter=it, cases=res)
                 if mean_search > best_search:

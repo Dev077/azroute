@@ -51,19 +51,22 @@ def _try_neighbourhood(prob: Problem, state: State, nets: List[int],
 
 
 def cleanup(prob: Problem, state: State, seconds: float = 30.0,
-            max_blockers: int = 6, verbose: bool = False) -> int:
-    """Improve a complete legal board in place. Returns the delay saved."""
+            max_blockers: int = 6, verbose: bool = False,
+            nets: Optional[List[int]] = None) -> int:
+    """Improve a complete legal board in place (only ``nets``, if given, are
+    rerouted first). Returns the delay saved."""
     assert state.done
     start_delay = state.delay
     t_end = time.time() + seconds
     improved = True
     sweep = 0
+    pool = list(range(prob.n)) if nets is None else list(nets)
     while improved and time.time() < t_end:
         improved = False
         sweep += 1
         # worst detours first
-        nets = sorted(range(prob.n), key=lambda i: prob.lb[i] - state.routes[i].delay)
-        for nid in nets:
+        order = sorted(pool, key=lambda i: (prob.lb[i] - state.routes[i].delay, i))
+        for nid in order:
             if time.time() >= t_end:
                 break
             cur = state.routes[nid]

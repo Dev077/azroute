@@ -1,10 +1,16 @@
-"""AlphaZero-style MCTS over "route net N with candidate C" moves.
+"""AlphaZero-style MCTS over kick moves on a complete routing.
 
-Single-player search, so Q values are min-max normalised over the tree before
-PUCT (as in MuZero). Leaves are scored by the GAT's value head, or, with
-``evaluator="rollout"``, by actually finishing the board with the rip-up router
-and scoring it (no network needed: a check of how far the search can go with
-an honest, if greedy, look at the outcome).
+The objective of an episode is the best board it reaches, so the return of a
+path is the highest score along it (each node's score is exact: every board in
+the tree is a real, legal routing), or at the leaf the value head's estimate of
+the best still to come. Single-player search, so Q values are min-max
+normalised over the tree before PUCT (as in MuZero). A kick that cannot be
+applied (a crossed net has nowhere left to go, or nothing would change) is
+masked out the first time the search tries it.
+
+``evaluator="heuristic"`` runs the same search without a network: priors favour
+the nets with the largest detour, and a leaf is worth its own score. It is the
+baseline the trained network is compared against.
 """
 from __future__ import annotations
 
@@ -15,38 +21,41 @@ from typing import List, Optional
 import numpy as np
 
 from .graph import build_graph
-from .problem import Candidate, Problem, State
+from .problem import Board, Move, State
 
 
 class Node:
-    __slots__ = ("state", "actions", "prior", "children", "N", "W", "expanded",
-                 "terminal", "value", "graph", "legal_p")
+    __slots__ = ("state", "depth", "score", "best_delay", "actions", "prior", "children", "dead",
+                 "N", "W", "expanded", "terminal", "value", "graph")
 
-    def __init__(self, state: State):
+    def __init__(self, state: State, depth: int, score: float, best_delay: int):
         self.state = state
-        self.actions: List[Candidate] = []
+        self.depth = depth                 # moves played since the episode began
+        self.score = score                 # this board's challenge score (exact)
+        self.best_delay = best_delay       # best board's delay on the way here
+        self.actions: List[Move] = []
         self.prior: List[float] = []
         self.children: List[Optional["Node"]] = []
+        self.dead: List[bool] = []         # kick could not be applied
         self.N = 0
         self.W = 0.0
         self.expanded = False
         self.terminal = False
-        self.value = 0.0      # evaluation at expansion (exact if terminal)
+        self.value = score                 # estimate of the best score reachable from here
         self.graph = None
-        self.legal_p = 1.0
 
     def q(self) -> float:
-        return self.W / self.N if self.N else 0.0
+        return self.W / self.N if self.N else self.value
 
 
 class MCTS:
-    def __init__(self, prob: Problem, model=None, device="cpu", c_puct: float = 1.5,
+    def __init__(self, board: Board, model=None, device="cpu", c_puct: float = 1.5,
                  evaluator: str = "net",
                  dirichlet_alpha: float = 0.3, noise_frac: float = 0.25,
                  rng: Optional[random.Random] = None):
-        assert evaluator in ("net", "rollout")
-        assert evaluator == "rollout" or model is not None
-        self.prob = prob
+        assert evaluator in ("net", "heuristic")
+        assert evaluator == "heuristic" or model is not None
+        self.board = board
         self.model = model
         self.device = device
         self.c_puct = c_puct
@@ -60,64 +69,72 @@ class MCTS:
         """Forget the Q range (call at the start of every episode)."""
         self.qmin, self.qmax = math.inf, -math.inf
 
+    def root(self, state: State) -> Node:
+        return Node(state, 0, self.board.prob.score(state.delay), state.delay)
+
     # -- expansion -------------------------------------------------------------
     def expand(self, node: Node) -> float:
-        prob, s = self.prob, node.state
+        board, s = self.board, node.state
         node.expanded = True
-        if s.failed:
-            return self._dead(node)
-        if s.done:
+        actions = board.actions(s) if node.depth < board.moves else []
+        if not actions:
             node.terminal = True
-            node.value = prob.score(s.delay)
+            node.value = node.score
             return node.value
-        frontier, actions = s.actions(prob, rng_seed=self.rng.randrange(1 << 30))
-        if actions is None:  # cannot happen after repair(); kept as a guard
-            return self._dead(node)
         node.actions = actions
         node.children = [None] * len(actions)
+        node.dead = [False] * len(actions)
         if self.evaluator == "net":
-            node.graph = build_graph(prob, s, frontier, actions)
-            prior, value, legal_p = self.model.evaluate(node.graph, self.device)
-            node.prior, node.value, node.legal_p = prior, value, legal_p
+            node.graph = build_graph(board, s, actions, node.depth, node.best_delay)
+            prior, gain = self.model.evaluate(node.graph, self.device)
+            node.prior = prior
+            node.value = node.score * (1.0 + max(0.0, gain) / 100.0)
         else:
-            # heuristic prior: prefer the negotiated route, then less detour
-            ws = [math.exp(-4.0 * (c.delay / prob.lb[c.net] - 1.0)) * (3.0 if c.profile == 0 else 1.0)
-                  for c in actions]
+            prob = board.prob
+            ws = [1.0 + 4.0 * (s.routes[nid].delay / prob.lb[nid] - 1.0) for nid, _k in actions]
             z = sum(ws)
             node.prior = [w / z for w in ws]
-            node.value = self._rollout(s)
+            node.value = node.score
         return node.value
 
-    def _dead(self, node: Node) -> float:
-        node.terminal = True
-        node.value = 0.0  # a failed routing is illegal, and illegal scores 0 in the challenge
-        node.actions, node.children, node.prior = [], [], []
-        return 0.0
-
-    def _rollout(self, state: State) -> float:
-        s = state.copy()
-        s.finish_greedy(self.prob)
-        return self.prob.score(s.delay) if s.done and not s.failed else 0.0
+    def child(self, node: Node, i: int) -> Optional[Node]:
+        """The node after move ``i`` (applied on first use); None if it can't be applied."""
+        if node.dead[i]:
+            return None
+        ch = node.children[i]
+        if ch is None:
+            s = self.board.apply(node.state, node.actions[i])
+            if s is None:
+                node.dead[i] = True
+                node.prior[i] = 0.0
+                return None
+            ch = Node(s, node.depth + 1, self.board.prob.score(s.delay),
+                      min(node.best_delay, s.delay))
+            node.children[i] = ch
+        return ch
 
     # -- search ------------------------------------------------------------------
     def add_noise(self, node: Node) -> None:
-        if len(node.prior) < 2:
+        live = [i for i in range(len(node.prior)) if not node.dead[i]]
+        if len(live) < 2:
             return
-        noise = np.random.default_rng(self.rng.randrange(1 << 30)).dirichlet(
-            [self.alpha] * len(node.prior))
+        noise = np.random.default_rng(self.rng.randrange(1 << 30)).dirichlet([self.alpha] * len(live))
         f = self.noise_frac
-        node.prior = [(1 - f) * p + f * float(n) for p, n in zip(node.prior, noise)]
+        for i, nz in zip(live, noise):
+            node.prior[i] = (1 - f) * node.prior[i] + f * float(nz)
 
     def _norm(self, q: float) -> float:
         if self.qmax > self.qmin:
             return (q - self.qmin) / (self.qmax - self.qmin)
         return 0.5
 
-    def _select(self, node: Node) -> int:
+    def _select(self, node: Node) -> Optional[int]:
         sqrt_n = math.sqrt(max(1, node.N))
         fpu = self._norm(node.q())
-        best, best_i = -math.inf, 0
+        best, best_i = -math.inf, None
         for i, p in enumerate(node.prior):
+            if node.dead[i]:
+                continue
             ch = node.children[i]
             if ch is not None and ch.N:
                 q, n = self._norm(ch.q()), ch.N
@@ -130,8 +147,7 @@ class MCTS:
 
     def search(self, root: Node, sims: int) -> None:
         if not root.expanded:
-            v = self.expand(root)
-            self._backup([root], v)
+            self._backup([root], self.expand(root))
         if root.terminal:
             return
         for _ in range(sims):
@@ -141,10 +157,13 @@ class MCTS:
                     v = node.value
                     break
                 i = self._select(node)
-                child = node.children[i]
-                if child is None:
-                    child = Node(node.state.apply(self.prob, node.actions[i]))
-                    node.children[i] = child
+                if i is None:            # every move from here failed: nothing left to try
+                    node.terminal, node.value = True, node.score
+                    v = node.value
+                    break
+                child = self.child(node, i)
+                if child is None:        # masked; pick again at the same node
+                    continue
                 path.append(child)
                 node = child
                 if not child.expanded:
@@ -153,29 +172,31 @@ class MCTS:
             self._backup(path, v)
 
     def _backup(self, path: List[Node], v: float) -> None:
-        self.qmin, self.qmax = min(self.qmin, v), max(self.qmax, v)
-        for n in path:
+        """Each node gets the best score from itself down to the leaf (or the leaf's estimate)."""
+        ret = v
+        for n in reversed(path):
+            ret = max(ret, n.score)
+            self.qmin, self.qmax = min(self.qmin, ret), max(self.qmax, ret)
             n.N += 1
-            n.W += v
+            n.W += ret
 
     # -- acting ------------------------------------------------------------------
     def visit_policy(self, root: Node) -> List[float]:
         visits = [ch.N if ch is not None else 0 for ch in root.children]
         tot = sum(visits)
-        if tot == 0:
-            return list(root.prior)
-        return [v / tot for v in visits]
+        return [v / tot for v in visits] if tot else [0.0] * len(visits)
 
-    def choose(self, root: Node, temperature: float) -> int:
+    def choose(self, root: Node, temperature: float) -> Optional[int]:
+        """Most-visited move (temperature 0) or one sampled from the visit counts;
+        None if no move from the root could be applied."""
         pi = self.visit_policy(root)
+        if not any(pi):
+            return None
         if temperature <= 1e-6:
             return max(range(len(pi)), key=lambda i: (pi[i], root.prior[i]))
         w = [p ** (1.0 / temperature) for p in pi]
         return self.rng.choices(range(len(pi)), weights=w)[0]
 
     def step(self, root: Node, i: int) -> Node:
-        """Commit action ``i``; the child becomes the new root (its subtree is kept)."""
-        child = root.children[i]
-        if child is None:
-            child = Node(root.state.apply(self.prob, root.actions[i]))
-        return child
+        """Commit move ``i`` (already applied by the search); its subtree is kept."""
+        return root.children[i]

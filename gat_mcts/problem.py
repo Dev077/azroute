@@ -1,4 +1,13 @@
-"""Routing state, candidate routes and exact delay for the GAT + MCTS router.
+"""Routing state, kick moves and exact delay for the GAT + MCTS router.
+
+The search improves a complete legal routing. It starts from the negotiated
+router's solution after the cleanup pass (a local optimum of single-net
+rerouting), and every move is a *kick*: re-route one net through other nets'
+wires at a crossing penalty (one of ``KICKS``), rip up the nets it crosses,
+re-route them, then let the nets next to the freed space take shorter routes
+(``settle``). A kick may make the board worse; the search keeps the best board
+it reaches. Kicks are what get past the cleanup pass: on the hard tier about one
+kick in ten, followed by the local settle, beats cleanup's result.
 
 Vertex ids follow ``m3d.grid.Grid``: ``vid = (z*height + y)*width + x``.
 
@@ -14,7 +23,6 @@ from __future__ import annotations
 
 import heapq
 import math
-import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -23,30 +31,17 @@ from m3d.model import Instance, NetRoute, Submission
 FREE = -1
 INF = float("inf")
 
-# Candidate-route profiles. Each unrouted net in the frontier gets (up to) one
-# candidate per profile; identical trees are deduplicated.
-#   ref        this net's route in the negotiated router's legal solution (offered
-#              while still free: choosing ref for every net reproduces the baseline)
-#   spt        exact shortest-path tree: the best delay this net can get right now
-#   spt_hist   SPT that avoids what the negotiated router found contended (its history costs)
-#   spt_cong   SPT that avoids congested / in-demand regions and other nets' pin access
-#   spt_outer  SPT that prefers the expensive outer layers (leaves the cheap middle free)
-#   steiner    tree grown sink by sink minimising wirelength (fewest resources)
-#   spt_noise  SPT under randomly perturbed region costs (diversity)
-PROFILES = ("ref", "spt", "spt_hist", "spt_cong", "spt_outer", "steiner", "spt_noise")
-K = len(PROFILES)
-
-CONG_GAMMA = 2.0       # spt_cong: cost multiplier per unit of congestion
-PIN_ACCESS_PEN = 4.0   # spt_cong: additive cost for hugging another unrouted net's pin
-OUTER_GAMMA = 2.5      # spt_outer: extra multiplier on the cheapest layer
-REPAIR_PEN = 20.0      # repair: cost of crossing another net's wire (x its rip count + 1)
-HIST_W = 2.0           # spt_hist: cost per unit of negotiated history on a vertex
+# Kick strengths: the cost of crossing one vertex of another net's wire when the
+# kicked net is re-routed. Low = take a shorter route and push many nets aside;
+# high = only cross where it saves a lot. Each finds different improvements.
+KICKS = (3.0, 6.0, 12.0)
+K = len(KICKS)
 
 
 @dataclass(frozen=True)
 class Candidate:
+    """One net's route."""
     net: int                          # net index
-    profile: int                      # index into PROFILES
     vids: frozenset                   # every vertex of the tree (pins included)
     edges: Tuple[Tuple[int, int], ...]  # (a, b) with a < b
     delay: int                        # exact sum of driver->sink path delays
@@ -54,18 +49,16 @@ class Candidate:
     regions: Tuple[Tuple[int, int], ...]  # (region index, vertices in it)
 
 
+Move = Tuple[int, int]   # (net index, kick index into KICKS)
+
+
 class Problem:
     """Static, per-instance data shared by every state of one episode."""
 
     def __init__(self, inst: Instance, baseline_total: int,
-                 reference: Optional[Submission] = None,
-                 history: Optional[Dict[int, float]] = None,
-                 frontier: int = 4, rip_limit: int = 8, seed: int = 0):
+                 reference: Optional[Submission] = None):
         self.inst = inst
         self.baseline_total = int(baseline_total)
-        self.frontier_size = frontier
-        self.rip_limit = rip_limit
-        self.seed = seed
         W, H, L = inst.width, inst.height, inst.layers
         self.W, self.H, self.L = W, H, L
         self.wh = W * H
@@ -86,13 +79,6 @@ class Problem:
         for i, pins in enumerate(self.net_pins):
             for v in pins:
                 self.pin_owner[v] = i
-        # vertices next to another net's pin: vid -> nets whose pin is adjacent
-        self.pin_adj: Dict[int, Set[int]] = {}
-        for i, pins in enumerate(self.net_pins):
-            for p in pins:
-                for q, _w in self.neighbors(p):
-                    if self.pin_owner[q] == FREE:
-                        self.pin_adj.setdefault(q, set()).add(i)
 
         # net geometry + static priority (bbox span incl. z, largest first, like
         # the reference routers)
@@ -106,6 +92,7 @@ class Problem:
         self.rank = {nid: r for r, nid in enumerate(self.order)}
         self.cross = [1.0 if len({self.coord(v)[2] for v in pins}) > 1 else 0.0
                       for pins in self.net_pins]
+        self.windows = [self.window(i) for i in range(self.n)]
 
         # regions: T x T tiles per layer, ~10 tiles a side
         T = max(2, math.ceil(max(W, H) / 10))
@@ -126,25 +113,23 @@ class Problem:
                 self.region_pins[self.region_of[v]] += 1
         lo, hi = min(self.layer_delay), max(self.layer_delay)
         self.cheapness = [((hi - d) / (hi - lo) if hi > lo else 0.0) for d in self.layer_delay]
-        self.outer_mult = [1.0 + OUTER_GAMMA * self.cheapness[self.region_z(r)]
-                           for r in range(self.R)]
+        self.min_step = lo   # cheapest delay of one in-plane step (for lower bounds)
 
-        # per-net lower bound: best delay with only the pins as obstacles
-        self.lb = []
+        # per-net ideal route (only the pins as obstacles) and its delay, the lower bound
+        self.ideal: List[Candidate] = []
         for i in range(self.n):
-            c = route_spt(self, self.pin_owner, i, profile=0)
+            c = route_spt(self, self.pin_owner, i)
             if c is None:
                 raise RuntimeError(f"net index {i} cannot be routed even on an empty grid")
-            self.lb.append(c.delay)
+            self.ideal.append(c)
+        self.lb = [c.delay for c in self.ideal]
         self.lb_total = sum(self.lb)
         self.mean_lb = self.lb_total / max(1, self.n)
 
-        # negotiated-router knowledge (both optional)
-        self.history = history or {}
+        # the negotiated router's legal solution (optional), as routes
         self.ref: List[Optional[Candidate]] = [None] * self.n
         if reference is not None:
             idx = {net.id: i for i, net in enumerate(inst.nets)}
-            p_ref = PROFILES.index("ref")
             for r in reference.routes:
                 nid = idx[r.net]
                 edges, vids = set(), set(self.net_pins[nid])
@@ -152,7 +137,7 @@ class Problem:
                     a, b = vid(*u), vid(*v)
                     edges.add((a, b) if a < b else (b, a))
                     vids.update((a, b))
-                self.ref[nid] = _finish(self, nid, p_ref, edges, vids)
+                self.ref[nid] = _finish(self, nid, edges, vids)
 
     # -- geometry -------------------------------------------------------------
     def coord(self, v: int) -> Tuple[int, int, int]:
@@ -265,15 +250,14 @@ def _dijkstra(prob: Problem, owner: Sequence[int], nid: int, seeds: Dict[int, fl
     return found, prev
 
 
-def _finish(prob: Problem, nid: int, profile: int, edges: Set[Tuple[int, int]],
-            vids: Set[int]) -> Candidate:
+def _finish(prob: Problem, nid: int, edges: Set[Tuple[int, int]], vids: Set[int]) -> Candidate:
     delay = tree_delay(prob, prob.net_pins[nid], edges)
     vias = sum(1 for a, b in edges if b - a == prob.wh)
     counts: Dict[int, int] = {}
     for v in vids:
         r = prob.region_of[v]
         counts[r] = counts.get(r, 0) + 1
-    return Candidate(nid, profile, frozenset(vids), tuple(sorted(edges)), delay, vias,
+    return Candidate(nid, frozenset(vids), tuple(sorted(edges)), delay, vias,
                      tuple(sorted(counts.items())))
 
 
@@ -295,14 +279,15 @@ def tree_delay(prob: Problem, pins: Sequence[int], edges: Iterable[Tuple[int, in
     return sum(dist[s] for s in pins[1:])
 
 
-def route_spt(prob: Problem, owner: Sequence[int], nid: int, profile: int = 0,
-              mult=None, vpen=None, soft=None) -> Optional[Candidate]:
-    """Shortest-path tree from the driver (exact best delay when costs are true delays)."""
+def route_spt(prob: Problem, owner: Sequence[int], nid: int,
+              mult=None, vpen=None, soft=None, bounds=None) -> Optional[Candidate]:
+    """Shortest-path tree from the driver (exact best delay when costs are true delays).
+    Searched in the net's window, then the whole grid; or only inside ``bounds``."""
     pins = prob.net_pins[nid]
     driver, sinks = pins[0], set(pins[1:])
-    for full in (False, True):
-        found, prev = _dijkstra(prob, owner, nid, {driver: 0.0}, sinks,
-                                prob.window(nid, full), mult, vpen, soft=soft)
+    tries = [bounds] if bounds is not None else [prob.window(nid), prob.window(nid, True)]
+    for b in tries:
+        found, prev = _dijkstra(prob, owner, nid, {driver: 0.0}, sinks, b, mult, vpen, soft=soft)
         if len(found) == len(sinks):
             break
     else:
@@ -316,78 +301,37 @@ def route_spt(prob: Problem, owner: Sequence[int], nid: int, profile: int = 0,
             p = prev[v]
             edges.add((p, v) if p < v else (v, p))
             v = p
-    return _finish(prob, nid, profile, edges, vids)
-
-
-def route_grow(prob: Problem, owner: Sequence[int], nid: int, beta: float, profile: int,
-               mult=None) -> Optional[Candidate]:
-    """Grow a tree sink by sink. Tree vertices seed the search at ``beta`` x their
-    delay from the driver: beta=0 is a wirelength-minimising Steiner-style tree,
-    beta=1 approaches the shortest-path tree."""
-    pins = prob.net_pins[nid]
-    driver = pins[0]
-    remaining = set(pins[1:])
-    dtree = {driver: 0}
-    edges: Set[Tuple[int, int]] = set()
-    while remaining:
-        seeds = {v: beta * d for v, d in dtree.items()}
-        for full in (False, True):
-            found, prev = _dijkstra(prob, owner, nid, seeds, remaining,
-                                    prob.window(nid, full), mult, None,
-                                    blocked=dtree, first_only=True)
-            if found:
-                break
-        else:
-            return None
-        path = [found[0]]
-        while prev[path[-1]] != -1:
-            path.append(prev[path[-1]])
-        path.reverse()  # path[0] is a tree vertex
-        for a, b in zip(path, path[1:]):
-            dtree[b] = dtree[a] + prob.edge_delay(a, b)
-            edges.add((a, b) if a < b else (b, a))
-        remaining.difference_update(path)
-    return _finish(prob, nid, profile, edges, set(dtree))
+    return _finish(prob, nid, edges, vids)
 
 
 # --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
 class State:
-    """One partial routing. Copy-on-apply: ``apply`` returns a new state."""
+    """A routing: complete and legal between moves. Copy-on-kick: ``kick`` returns
+    a new state; ``lay``/``rip`` change it in place (cleanup, kicks)."""
 
-    __slots__ = ("owner", "routes", "unrouted", "cache", "region_occ", "delay",
-                 "step", "rips", "failed", "_demand")
+    __slots__ = ("owner", "routes", "unrouted", "region_occ", "delay")
 
-    def __init__(self, owner, routes, unrouted, cache, region_occ, delay, step,
-                 rips=None, failed=False):
+    def __init__(self, owner, routes, unrouted, region_occ, delay):
         self.owner: List[int] = owner
         self.routes: Dict[int, Candidate] = routes
         self.unrouted: Set[int] = unrouted
-        # net -> (valid candidates, profiles already tried)
-        self.cache: Dict[int, Tuple[Tuple[Candidate, ...], frozenset]] = cache
         self.region_occ: List[int] = region_occ
         self.delay: int = delay
-        self.step: int = step
-        self.rips: Dict[int, int] = rips if rips is not None else {}  # repairs per net
-        self.failed: bool = failed   # a net needed repair more than rip_limit times
-        self._demand = None
 
     @staticmethod
     def initial(prob: Problem) -> "State":
-        occ = list(prob.region_pins)
-        return State(list(prob.pin_owner), {}, set(range(prob.n)), {}, occ, 0, 0)
+        return State(list(prob.pin_owner), {}, set(range(prob.n)), list(prob.region_pins), 0)
 
     def copy(self) -> "State":
         return State(list(self.owner), dict(self.routes), set(self.unrouted),
-                     dict(self.cache), list(self.region_occ), self.delay, self.step,
-                     dict(self.rips), self.failed)
+                     list(self.region_occ), self.delay)
 
     @property
     def done(self) -> bool:
         return not self.unrouted
 
-    # -- mutation (used in place by cleanup; via apply() by the search) ----------
     def lay(self, prob: Problem, cand: Candidate) -> None:
         nid = cand.net
         owner, occ, region = self.owner, self.region_occ, prob.region_of
@@ -398,13 +342,6 @@ class State:
         self.routes[nid] = cand
         self.unrouted.discard(nid)
         self.delay += cand.delay
-        self.cache.pop(nid, None)
-        self._demand = None
-        # drop other nets' candidates that now collide with this route
-        for other, (cands, tried) in list(self.cache.items()):
-            keep = tuple(c for c in cands if c.vids.isdisjoint(cand.vids))
-            if len(keep) != len(cands):
-                self.cache[other] = (keep, frozenset(c.profile for c in keep))
 
     def rip(self, prob: Problem, nid: int) -> Candidate:
         cand = self.routes.pop(nid)
@@ -415,223 +352,21 @@ class State:
                 occ[region[v]] -= 1
         self.unrouted.add(nid)
         self.delay -= cand.delay
-        self.cache.clear()
-        self._demand = None
         return cand
 
-    def apply(self, prob: Problem, cand: Candidate) -> "State":
-        """Lay ``cand`` on a copy, then repair any net it cut off."""
-        s = self.copy()
-        s.lay(prob, cand)
-        s.step += 1
-        s.repair(prob)
-        return s
+    def detour(self, prob: Problem, nid: int) -> int:
+        """Delay above the net's lower bound (0 = it already has its ideal delay)."""
+        return self.routes[nid].delay - prob.lb[nid]
 
-    def repair(self, prob: Problem) -> bool:
-        """Rip-up repair, so the episode never dead-ends.
-
-        Any unrouted net that can no longer reach all its pins is routed through
-        other nets' wires at a penalty (PathFinder-style: the penalty grows with how
-        often the crossed net has already been ripped), so it disturbs as few nets
-        as possible; the nets it crosses are ripped up and go back to the unrouted
-        pool. A net needing this more than ``prob.rip_limit`` times marks the state
-        failed (scored 0, like an illegal submission).
-        """
-        rips = self.rips
-
-        def soft(o):
-            return REPAIR_PEN * (1 + rips.get(o, 0))
-        while not self.failed:
-            dead = self.dead_nets(prob)
-            if not dead:
-                return True
-            for nid in dead:
-                if nid not in self.unrouted:
-                    continue
-                self.rips[nid] = self.rips.get(nid, 0) + 1
-                if self.rips[nid] > prob.rip_limit:
-                    self.failed = True
-                    break
-                route = route_spt(prob, self.owner, nid, soft=soft)
-                owner = self.owner
-                for b in {owner[v] for v in route.vids if owner[v] not in (FREE, nid)}:
-                    self.rips[b] = self.rips.get(b, 0) + 1
-                    self.rip(prob, b)
-                self.lay(prob, route)
-        return False
-
-    # -- search helpers --------------------------------------------------------
-    def frontier(self, prob: Problem) -> List[int]:
-        """The next few unrouted nets in priority order: the nets MCTS may pick from."""
-        out = []
-        for nid in prob.order:
-            if nid in self.unrouted:
-                out.append(nid)
-                if len(out) == prob.frontier_size:
-                    break
-        return out
-
-    def finish_greedy(self, prob: Problem) -> None:
-        """Route every remaining net in place, cheaply: its negotiated (ref) route if
-        still free, else the history-aware shortest-path tree, repairing as needed.
-        Used to score MCTS leaves by rollout."""
-        hist = prob.history
-
-        def vpen(v):
-            return HIST_W * hist.get(v, 0.0)
-        while not self.done and not self.failed:
-            nid = next(i for i in prob.order if i in self.unrouted)
-            r = prob.ref[nid]
-            if r is None or not all(self.owner[v] in (FREE, nid) for v in r.vids):
-                r = route_spt(prob, self.owner, nid, vpen=vpen if hist else None)
-            if r is None:  # cut off: repair() routes it through other nets' wires
-                self.repair(prob)
-                continue
-            self.lay(prob, r)
-            self.repair(prob)
-
-    def actions(self, prob: Problem, rng_seed: int = 0):
-        """``(frontier, candidates of all frontier nets)``; candidates is None if a
-        frontier net has none (cannot happen after ``repair``)."""
-        frontier = self.frontier(prob)
-        out: List[Candidate] = []
-        for nid in frontier:
-            cands = self.candidates(prob, nid, rng_seed=rng_seed)
-            if not cands:
-                return frontier, None
-            out.extend(cands)
-        return frontier, out
-
-    def demand(self, prob: Problem) -> List[float]:
-        """Per-region future demand from unrouted nets (RUDY: wirelength / bbox area,
-        spread uniformly over the bbox, shared over all layers)."""
-        if self._demand is not None:
-            return self._demand
-        T, TX, TY = prob.tile, prob.TX, prob.TY
-        diff = [[0.0] * (TX + 1) for _ in range(TY + 1)]
-        for nid in self.unrouted:
-            x0, x1, y0, y1, _, _ = prob.bbox[nid]
-            tx0, tx1, ty0, ty1 = x0 // T, x1 // T, y0 // T, y1 // T
-            ntiles = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
-            dens = prob.lb[nid] / (ntiles * T * T * prob.L * max(1, len(prob.net_pins[nid]) - 1))
-            diff[ty0][tx0] += dens; diff[ty0][tx1 + 1] -= dens
-            diff[ty1 + 1][tx0] -= dens; diff[ty1 + 1][tx1 + 1] += dens
-        for ty in range(TY + 1):
-            for tx in range(1, TX + 1):
-                diff[ty][tx] += diff[ty][tx - 1]
-        for ty in range(1, TY + 1):
-            for tx in range(TX + 1):
-                diff[ty][tx] += diff[ty - 1][tx]
-        plane = [diff[ty][tx] for ty in range(TY) for tx in range(TX)]
-        self._demand = plane * prob.L
-        return self._demand
-
-    def candidates(self, prob: Problem, nid: int, rng_seed: int = 0) -> Tuple[Candidate, ...]:
-        """Candidate routes for ``nid`` (cached; only missing profiles are recomputed)."""
-        cands, tried = self.cache.get(nid, ((), frozenset()))
-        if len(tried) == K:
-            return cands
-        out = list(cands)
-        seen = {c.edges for c in out}
+    def ideal_hits(self, prob: Problem, nid: int) -> Dict[int, int]:
+        """Nets whose wires the net's ideal route runs through -> vertices shared."""
         owner = self.owner
-        for p in range(K):
-            if p in tried:
-                continue
-            name = PROFILES[p]
-            if name == "ref":
-                r = prob.ref[nid]
-                if r is not None and all(owner[v] in (FREE, nid) for v in r.vids):
-                    if r.edges not in seen:
-                        seen.add(r.edges)
-                        out.append(r)
-                continue
-            if name == "spt":
-                c = route_spt(prob, owner, nid, p)
-            elif name == "spt_hist":
-                if not prob.history:
-                    continue
-                hist = prob.history
-                c = route_spt(prob, owner, nid, p,
-                              vpen=lambda v: HIST_W * hist.get(v, 0.0))
-            elif name == "spt_cong":
-                dem, occ, size = self.demand(prob), self.region_occ, prob.region_size
-                mult = [1.0 + CONG_GAMMA * (occ[r] / size[r] + dem[r]) for r in range(prob.R)]
-                unrouted, pin_adj = self.unrouted, prob.pin_adj
-
-                def vpen(v, _nid=nid):
-                    nets = pin_adj.get(v)
-                    if nets and any(o != _nid and o in unrouted for o in nets):
-                        return PIN_ACCESS_PEN
-                    return 0.0
-                c = route_spt(prob, owner, nid, p, mult, vpen)
-            elif name == "spt_outer":
-                c = route_spt(prob, owner, nid, p, prob.outer_mult)
-            elif name == "steiner":
-                c = route_grow(prob, owner, nid, 0.0, p)
-            else:  # spt_noise
-                rng = random.Random(hash((prob.seed, rng_seed, nid, self.step)))
-                mult = [1.0 + 0.5 * rng.random() for _ in range(prob.R)]
-                c = route_spt(prob, owner, nid, p, mult)
-            if c is None:
-                # unreachable under one cost is unreachable under all
-                self.cache[nid] = ((), frozenset(range(K)))
-                return ()
-            if c.edges not in seen:
-                seen.add(c.edges)
-                out.append(c)
-        out.sort(key=lambda c: c.profile)
-        res = tuple(out)
-        self.cache[nid] = (res, frozenset(range(K)))
-        return res
-
-    def dead_nets(self, prob: Problem) -> List[int]:
-        """Unrouted nets whose pins can no longer be connected at all.
-
-        Exact: an unrouted net may only use free vertices and its own pins, so it
-        is routable iff all its pins fall in one component of that graph.
-        """
-        owner, V = self.owner, prob.V
-        comp = [-1] * V
-        label = 0
-        for s in range(V):
-            if owner[s] != FREE or comp[s] != -1:
-                continue
-            comp[s] = label
-            stack = [s]
-            while stack:
-                u = stack.pop()
-                for v, _w in prob.neighbors(u):
-                    if owner[v] == FREE and comp[v] == -1:
-                        comp[v] = label
-                        stack.append(v)
-            label += 1
-        dead = []
-        for nid in self.unrouted:
-            pins = prob.net_pins[nid]
-            pinset = set(pins)
-            # union-find over the pins: two pins join through a shared free
-            # component or by being adjacent
-            parent = {p: p for p in pins}
-
-            def find(a):
-                while parent[a] != a:
-                    parent[a] = parent[parent[a]]
-                    a = parent[a]
-                return a
-            comp_pin: Dict[int, int] = {}
-            for p in pins:
-                for q, _w in prob.neighbors(p):
-                    if q in pinset:
-                        parent[find(p)] = find(q)
-                    elif owner[q] == FREE:
-                        c = comp[q]
-                        if c in comp_pin:
-                            parent[find(p)] = find(comp_pin[c])
-                        else:
-                            comp_pin[c] = p
-            if len({find(p) for p in pins}) > 1:
-                dead.append(nid)
-        return dead
+        out: Dict[int, int] = {}
+        for v in prob.ideal[nid].vids:
+            o = owner[v]
+            if o != FREE and o != nid:
+                out[o] = out.get(o, 0) + 1
+        return out
 
     # -- output ------------------------------------------------------------------
     def to_submission(self, prob: Problem) -> Submission:
@@ -655,8 +390,166 @@ class State:
                 a, b = prob.vid(*u), prob.vid(*v)
                 edges.add((a, b) if a < b else (b, a))
                 vids.update((a, b))
-            s.lay(prob, _finish(prob, nid, 0, edges, vids))
+            s.lay(prob, _finish(prob, nid, edges, vids))
         return s
+
+
+# --------------------------------------------------------------------------- #
+# Moves
+# --------------------------------------------------------------------------- #
+def _sink_delays(prob: Problem, cand: Candidate) -> List[Tuple[int, int]]:
+    """(sink, driver->sink delay along the net's tree) for each sink."""
+    adj: Dict[int, List[int]] = {}
+    for a, b in cand.edges:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    pins = prob.net_pins[cand.net]
+    dist = {pins[0]: 0}
+    stack = [pins[0]]
+    while stack:
+        u = stack.pop()
+        for v in adj.get(u, ()):
+            if v not in dist:
+                dist[v] = dist[u] + prob.edge_delay(u, v)
+                stack.append(v)
+    return [(s, dist[s]) for s in pins[1:]]
+
+
+def _could_shorten(prob: Problem, cand: Candidate, freed: List[Tuple[int, int, int]]) -> bool:
+    """Whether any freed vertex (x, y, z) could lie on a path shorter than the
+    net's current one to some sink: a lower bound on delay (cheapest layer per
+    step, a via per layer change) through it must beat that sink's delay. A net
+    that was already routed as well as it could be can only improve through
+    newly freed space, so the others need no Dijkstra."""
+    c, via, W, wh = prob.min_step, prob.via, prob.W, prob.wh
+    sinks = []
+    for s, d in _sink_delays(prob, cand):
+        z, r = divmod(s, wh)
+        y, x = divmod(r, W)
+        sinks.append((x, y, z, d))
+    far = max(d for *_xyz, d in sinks)
+    z0, r = divmod(prob.net_pins[cand.net][0], wh)
+    y0, x0 = divmod(r, W)
+    for fx, fy, fz in freed:
+        a = c * (abs(fx - x0) + abs(fy - y0)) + via * abs(fz - z0)
+        if a >= far:
+            continue
+        for sx, sy, sz, d in sinks:
+            if a + c * (abs(fx - sx) + abs(fy - sy)) + via * abs(fz - sz) < d:
+                return True
+    return False
+
+
+def settle(prob: Problem, state: State, freed: Set[int], budget: int) -> int:
+    """Let nets next to newly freed vertices take shorter routes, in place.
+
+    Only nets whose search window overlaps the freed space, and which could
+    possibly get shorter through it (``_could_shorten``), are retried (worst
+    detour first); a net that improves frees space of its own, which is handled
+    the same way. At most ``budget`` reroutes are tried. Returns how many."""
+    tries = 0
+    xs, ys, wins, wh = prob.xs, prob.ys, prob.windows, prob.wh
+    while freed and tries < budget:
+        fx0 = min(xs[v] for v in freed); fx1 = max(xs[v] for v in freed)
+        fy0 = min(ys[v] for v in freed); fy1 = max(ys[v] for v in freed)
+        nets = [i for i, r in state.routes.items() if r.delay > prob.lb[i]
+                and not (wins[i][1] < fx0 or wins[i][0] > fx1 or wins[i][3] < fy0 or wins[i][2] > fy1)]
+        nets.sort(key=lambda i: (prob.lb[i] - state.routes[i].delay, i))
+        pts = [(xs[v], ys[v], v // wh) for v in freed]
+        freed = set()
+        for nid in nets:
+            if tries >= budget:
+                break
+            if not _could_shorten(prob, state.routes[nid], pts):
+                continue
+            tries += 1
+            cur = state.routes[nid]
+            # a box around the pins and the current route: the current route
+            # still fits, so the reroute is never worse, and the search stays small
+            x0, x1, y0, y1, _, _ = prob.bbox[nid]
+            rx = [xs[v] for v in cur.vids]; ry = [ys[v] for v in cur.vids]
+            box = (max(0, min(x0, min(rx)) - 2), min(prob.W - 1, max(x1, max(rx)) + 2),
+                   max(0, min(y0, min(ry)) - 2), min(prob.H - 1, max(y1, max(ry)) + 2))
+            state.rip(prob, nid)
+            c = route_spt(prob, state.owner, nid, bounds=box)
+            if c is not None and c.delay < cur.delay:
+                state.lay(prob, c)
+                freed |= cur.vids - c.vids
+            else:
+                state.lay(prob, cur)
+    return tries
+
+
+def kick(prob: Problem, state: State, move: Move, settle_budget: int) -> Optional[State]:
+    """Apply a kick to a copy of ``state``: re-route the net crossing other nets'
+    wires at ``KICKS[k]`` per vertex, rip up the nets it crosses and re-route them
+    (largest first), then ``settle``. Returns None if a crossed net can no longer
+    be routed, or if the kick would change nothing."""
+    nid, k = move
+    pen = KICKS[k]
+    s = state.copy()
+    old = [s.rip(prob, nid)]
+    r = route_spt(prob, s.owner, nid, soft=lambda o: pen)
+    if r is None:  # cannot happen: its own old route is still free
+        return None
+    owner = s.owner
+    hit = {owner[v] for v in r.vids if owner[v] != FREE and owner[v] != nid}
+    if not hit and r.edges == old[0].edges:
+        return None
+    for b in hit:
+        old.append(s.rip(prob, b))
+    s.lay(prob, r)
+    for b in sorted(hit, key=lambda i: prob.rank[i]):
+        c = route_spt(prob, s.owner, b)
+        if c is None:
+            return None
+        s.lay(prob, c)
+    freed = {v for o in old for v in o.vids if owner[v] == FREE}
+    settle(prob, s, freed, settle_budget)
+    return s
+
+
+class Board:
+    """One search problem: a starting routing, the nets that may be kicked (all
+    of them, or a window of a large board), and the move budget of an episode."""
+
+    def __init__(self, prob: Problem, start: State, moves: int, settle_budget: int = 40,
+                 nets: Optional[Sequence[int]] = None):
+        assert start.done
+        self.prob = prob
+        self.start = start
+        self.moves = moves
+        self.settle_budget = settle_budget
+        self.nets = sorted(nets) if nets is not None else list(range(prob.n))
+
+    def actions(self, state: State) -> List[Move]:
+        """Every kick of every kickable net that isn't already at its lower bound."""
+        prob = self.prob
+        return [(nid, k) for nid in self.nets if state.routes[nid].delay > prob.lb[nid]
+                for k in range(K)]
+
+    def apply(self, state: State, move: Move) -> Optional[State]:
+        return kick(self.prob, state, move, self.settle_budget)
+
+
+def window_nets(prob: Problem, size: int, rng) -> List[int]:
+    """``size`` nets clustered around a random one: the kickable nets of a large board."""
+    def centre(i):
+        x0, x1, y0, y1, _, _ = prob.bbox[i]
+        return (x0 + x1) / 2, (y0 + y1) / 2
+    cx, cy = centre(rng.randrange(prob.n))
+    near = sorted(range(prob.n), key=lambda i: ((centre(i)[0] - cx) ** 2 + (centre(i)[1] - cy) ** 2, i))
+    return near[:size]
+
+
+def nets_around(prob: Problem, nets: Sequence[int]) -> List[int]:
+    """``nets`` plus every net whose search window overlaps theirs: the nets a kick
+    in ``nets`` (and its settle) can move."""
+    w = prob.windows
+    x0 = min(w[i][0] for i in nets); x1 = max(w[i][1] for i in nets)
+    y0 = min(w[i][2] for i in nets); y1 = max(w[i][3] for i in nets)
+    return [i for i in range(prob.n)
+            if not (w[i][1] < x0 or w[i][0] > x1 or w[i][3] < y0 or w[i][2] > y1)]
 
 
 def negotiate(inst: Instance, order: str = "bbox_desc") -> Tuple[Optional[Submission], Dict[int, float]]:

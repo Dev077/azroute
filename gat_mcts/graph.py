@@ -1,18 +1,18 @@
-"""Turn a routing state into a heterogeneous graph for the GAT.
+"""Turn a routing (and the kicks on offer) into a heterogeneous graph for the GAT.
 
 Node types
-  net     every net (routed, in the frontier, or still waiting)
-  cand    one node per candidate route of the frontier nets: these are the actions
+  net     every net, with its current route
+  cand    one node per move: kick net N at strength k (these are the actions)
   region  a tile x tile patch of one routing layer, with its congestion
 
 Edge types (each with a 1-d edge weight, and a reverse edge so information flows
 both ways)
   cand -of-> net, net -has-> cand
-  cand -uses-> region          weight: fraction of the region the candidate uses
+  cand -uses-> region          where the kicked net's ideal route runs (weight: fraction)
+  cand -hits-> net             nets whose wires that ideal route crosses (weight: share of it)
   net -pin-> region            where the net's pins sit
-  net -route-> region          where a routed net's wires sit (weight: fraction)
+  net -route-> region          where the net's wires sit (weight: fraction)
   region -adj-> region         neighbouring tiles on a layer (1) and across a via (0)
-  cand -conflict-> cand        candidates of different nets sharing a vertex
 """
 from __future__ import annotations
 
@@ -22,26 +22,26 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 from torch_geometric.data import HeteroData
 
-from .problem import K, Candidate, Problem, State
+from .problem import K, KICKS, Board, Move, State
 
 N_DIM = 11
-C_DIM = 8 + K
-R_DIM = 9
-G_DIM = 8
+C_DIM = 7 + K
+R_DIM = 8
+G_DIM = 9
 
 EDGE_TYPES = [
     ("cand", "of", "net"), ("net", "has", "cand"),
     ("cand", "uses", "region"), ("region", "used_by", "cand"),
+    ("cand", "hits", "net"), ("net", "hit_by", "cand"),
     ("net", "pin", "region"), ("region", "pin_of", "net"),
     ("net", "route", "region"), ("region", "route_of", "net"),
     ("region", "adj", "region"),
-    ("cand", "conflict", "cand"),
 ]
 
 _region_adj_cache: list = [None, None]  # [problem, (edge_index, edge_attr)]
 
 
-def _region_adjacency(prob: Problem):
+def _region_adjacency(prob):
     if _region_adj_cache[0] is not prob:
         TX, TY, L = prob.TX, prob.TY, prob.L
         src, dst, w = [], [], []
@@ -67,32 +67,31 @@ def _edges(pairs: List[Tuple[int, int]], weights: List[float]):
     return ei, torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
 
 
-def build_graph(prob: Problem, state: State, frontier: Sequence[int],
-                actions: Sequence[Candidate]) -> HeteroData:
-    """``actions`` must be the frontier nets' candidates, in action order."""
+def build_graph(board: Board, state: State, actions: Sequence[Move], depth: int,
+                best_delay: int) -> HeteroData:
+    """``actions`` are the moves on offer, in action order; ``depth`` is how many
+    moves of the episode have been played; ``best_delay`` is the best board's
+    total delay so far this episode."""
+    prob = board.prob
     data = HeteroData()
     n, R, L = prob.n, prob.R, prob.L
-    lb = prob.lb
-    front = set(frontier)
-    by_net: Dict[int, List[Candidate]] = {}
-    for c in actions:
-        by_net.setdefault(c.net, []).append(c)
-    best = {nid: min(c.delay for c in cs) for nid, cs in by_net.items()}
+    lb, routes = prob.lb, state.routes
+    size = prob.region_size
+    kick_nets = sorted({nid for nid, _k in actions})
+    hits: Dict[int, Dict[int, int]] = {nid: state.ideal_hits(prob, nid) for nid in kick_nets}
+    gap = [routes[i].delay / lb[i] - 1.0 for i in range(n)]
 
     # ---- region nodes ----
-    dem = state.demand(prob)
     occ = state.region_occ
-    size = prob.region_size
     usage = [0.0] * R
-    for c in actions:
-        for r, cnt in c.regions:
+    for nid in kick_nets:
+        for r, cnt in prob.ideal[nid].regions:
             usage[r] += cnt
     TX, TY = prob.TX, prob.TY
     rx = []
     for r in range(R):
         z = prob.region_z(r)
-        rem = r % (TX * TY)
-        ty, tx = divmod(rem, TX)
+        ty, tx = divmod(r % (TX * TY), TX)
         rx.append([
             z / max(1, L - 1),
             1.0 - prob.cheapness[z],
@@ -101,92 +100,78 @@ def build_graph(prob: Problem, state: State, frontier: Sequence[int],
             (ty + 0.5) / TY,
             occ[r] / size[r],
             prob.region_pins[r] / size[r],
-            min(4.0, dem[r] * 4.0),
             math.log1p(usage[r] / size[r]),
         ])
     data["region"].x = torch.tensor(rx, dtype=torch.float32)
 
     # ---- net nodes ----
+    start = board.start.routes
+    kickable = set(kick_nets)
+    hit_count = [0] * n
+    for hs in hits.values():
+        for o in hs:
+            hit_count[o] += 1
     nx = []
     for nid in range(n):
         x0, x1, y0, y1, _, _ = prob.bbox[nid]
-        routed = nid in state.routes
-        cs = by_net.get(nid, ())
+        pins = len(prob.net_pins[nid])
+        c = routes[nid]
         nx.append([
-            math.log1p(len(prob.net_pins[nid]) - 1) / math.log(8),
+            math.log1p(pins - 1) / math.log(8),
             prob.cross[nid],
             (x1 - x0) / prob.W,
             (y1 - y0) / prob.H,
             math.log1p(lb[nid] / prob.mean_lb),
-            1.0 if routed else 0.0,
-            1.0 if nid in front else 0.0,
-            (state.routes[nid].delay / lb[nid] - 1.0) if routed else 0.0,
-            len(cs) / K,
-            (best[nid] / lb[nid] - 1.0) if cs else 0.0,
-            prob.rank[nid] / max(1, n - 1),
+            gap[nid],
+            math.log1p((c.delay - lb[nid]) / prob.mean_lb),
+            c.vias / (pins * max(1, L - 1)),
+            1.0 if nid in kickable else 0.0,
+            0.0 if c is start[nid] else 1.0,          # changed since the episode began
+            math.log1p(hit_count[nid]) / math.log(8),  # how many kicks would push it aside
         ])
     data["net"].x = torch.tensor(nx, dtype=torch.float32)
 
-    # ---- candidate nodes + conflicts ----
-    vert_cands: Dict[int, List[int]] = {}
-    for i, c in enumerate(actions):
-        for v in c.vids:
-            vert_cands.setdefault(v, []).append(i)
-    shared: Dict[Tuple[int, int], int] = {}
-    for idxs in vert_cands.values():
-        if len(idxs) < 2:
-            continue
-        for a in idxs:
-            for b in idxs:
-                if a != b and actions[a].net != actions[b].net:
-                    shared[(a, b)] = shared.get((a, b), 0) + 1
-    conflict_amount = [0] * len(actions)
-    conflict_nets: List[set] = [set() for _ in actions]
-    for (a, b), cnt in shared.items():
-        conflict_amount[a] += cnt
-        conflict_nets[a].add(actions[b].net)
-
-    unrouted = state.unrouted
+    # ---- move nodes ----
     cx = []
-    for i, c in enumerate(actions):
-        pins = prob.net_pins[c.net]
-        x0, x1, y0, y1, z0, z1 = prob.bbox[c.net]
-        hpwl = (x1 - x0) + (y1 - y0) + (z1 - z0)
-        inplane = [(a, b) for a, b in c.edges if b - a != prob.wh]
-        cheap = (sum(prob.cheapness[a // prob.wh] for a, _ in inplane) / len(inplane)
-                 if inplane else 0.0)
-        hug = set()
-        for v in c.vids:
-            for o in prob.pin_adj.get(v, ()):
-                if o != c.net and o in unrouted:
-                    hug.add(o)
+    for nid, k in actions:
+        hs = hits[nid]
+        ideal = prob.ideal[nid]
+        crossed = sum(hs.values())
         onehot = [0.0] * K
-        onehot[c.profile] = 1.0
+        onehot[k] = 1.0
         cx.append([
-            c.delay / lb[c.net] - 1.0,
-            (c.delay - best[c.net]) / lb[c.net],
-            len(c.edges) / (hpwl + len(pins)),
-            c.vias / (len(pins) * max(1, L - 1)),
-            cheap,
-            conflict_amount[i] / len(c.vids),
-            len(conflict_nets[i]) / max(1, prob.frontier_size),
-            len(hug) / len(pins),
+            gap[nid],
+            (routes[nid].delay - lb[nid]) / prob.mean_lb,   # most it could save
+            len(hs) / 4.0,
+            crossed / len(ideal.vids),
+            sum(gap[o] for o in hs) / 4.0,                 # how bent the crossed nets already are
+            sum(1 for o in hs if o in kickable) / 4.0,
+            KICKS[k] / KICKS[-1],
         ] + onehot)
     data["cand"].x = torch.tensor(cx, dtype=torch.float32).reshape(-1, C_DIM)
 
     # ---- edges ----
-    of = [(i, c.net) for i, c in enumerate(actions)]
+    of = [(i, nid) for i, (nid, _k) in enumerate(actions)]
     ei, ea = _edges(of, [1.0] * len(of))
     data["cand", "of", "net"].edge_index, data["cand", "of", "net"].edge_attr = ei, ea
     data["net", "has", "cand"].edge_index, data["net", "has", "cand"].edge_attr = ei.flip(0), ea
 
     uses, uw = [], []
-    for i, c in enumerate(actions):
-        for r, cnt in c.regions:
+    for i, (nid, _k) in enumerate(actions):
+        for r, cnt in prob.ideal[nid].regions:
             uses.append((i, r)); uw.append(cnt / size[r])
     ei, ea = _edges(uses, uw)
     data["cand", "uses", "region"].edge_index, data["cand", "uses", "region"].edge_attr = ei, ea
     data["region", "used_by", "cand"].edge_index, data["region", "used_by", "cand"].edge_attr = ei.flip(0), ea
+
+    hit_e, hw = [], []
+    for i, (nid, _k) in enumerate(actions):
+        nv = len(prob.ideal[nid].vids)
+        for o, cnt in hits[nid].items():
+            hit_e.append((i, o)); hw.append(cnt / nv)
+    ei, ea = _edges(hit_e, hw)
+    data["cand", "hits", "net"].edge_index, data["cand", "hits", "net"].edge_attr = ei, ea
+    data["net", "hit_by", "cand"].edge_index, data["net", "hit_by", "cand"].edge_attr = ei.flip(0), ea
 
     pin_e = []
     for nid in range(n):
@@ -197,7 +182,7 @@ def build_graph(prob: Problem, state: State, frontier: Sequence[int],
     data["region", "pin_of", "net"].edge_index, data["region", "pin_of", "net"].edge_attr = ei.flip(0), ea
 
     route_e, rw = [], []
-    for nid, c in state.routes.items():
+    for nid, c in routes.items():
         for r, cnt in c.regions:
             route_e.append((nid, r)); rw.append(cnt / size[r])
     ei, ea = _edges(route_e, rw)
@@ -207,20 +192,16 @@ def build_graph(prob: Problem, state: State, frontier: Sequence[int],
     ei, ea = _region_adjacency(prob)
     data["region", "adj", "region"].edge_index, data["region", "adj", "region"].edge_attr = ei, ea
 
-    pairs = list(shared.keys())
-    ei, ea = _edges(pairs, [shared[p] / len(actions[p[0]].vids) for p in pairs])
-    data["cand", "conflict", "cand"].edge_index, data["cand", "conflict", "cand"].edge_attr = ei, ea
-
     # ---- graph-level features ----
-    routed_lb = sum(lb[i] for i in state.routes)
     data.g = torch.tensor([[
-        len(state.routes) / n,
+        (board.moves - depth) / max(1, board.moves),          # moves left
+        prob.lb_total / state.delay,                            # how close to the lower bound
+        prob.baseline_total / prob.lb_total,                    # the best score this case could ever reach
+        100.0 * (board.start.delay / state.delay - 1.0),        # gain so far this episode (%)
+        100.0 * (state.delay / best_delay - 1.0),               # how far above the best board so far (%)
         math.log(max(2, n)) / math.log(1000),
-        (state.delay / routed_lb - 1.0) if routed_lb else 0.0,
-        prob.baseline_total / prob.lb_total,   # the best score this case could ever reach
-        sum(occ) / prob.V,
-        sum(dem) / R,
         math.log(prob.W * prob.H / 1600.0 + 1.0),
-        sum(state.rips.values()) / n,
+        sum(occ) / prob.V,
+        sum(1 for i in range(n) if routes[i].delay == lb[i]) / n,
     ]], dtype=torch.float32)
     return data

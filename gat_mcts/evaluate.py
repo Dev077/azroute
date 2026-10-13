@@ -3,14 +3,13 @@
     python -m gat_mcts.evaluate --tier hard --ckpt runs/gat_mcts/latest.pt \
         --out submissions_local/hard/gat_mcts
 
-Per case: negotiated router (ref routes + history costs) -> MCTS with the GAT ->
-negotiated fallback if the search fails -> cleanup pass. Writes
+Per case: negotiated router -> cleanup pass -> up to --rounds MCTS episodes of
+--moves kicks, each from the best board so far -> cleanup pass. Writes
 <case>.sol.json, runtime.json (wall-clock per case, everything included) and
 meta.json, then scores the directory with the toolkit's scorer.
 
-Use ``--evaluator rollout`` (no checkpoint) to run the same search with leaves
-scored by actually finishing the board instead of the value head: a check of
-how far the search itself can go before any training.
+Use ``--evaluator heuristic`` (no checkpoint) to run the same search without a
+network: a check of how far the search itself goes before any training.
 """
 from __future__ import annotations
 
@@ -32,12 +31,17 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--tier", default="hard", choices=list(TIER_DIRS))
     ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--evaluator", default="net", choices=["net", "rollout"])
+    ap.add_argument("--evaluator", default="net", choices=["net", "heuristic"])
     ap.add_argument("--out", required=True, help="submission directory to write")
     ap.add_argument("--cases", default=None, help="comma-separated case names (default: all)")
-    ap.add_argument("--sims", type=int, default=32)
-    ap.add_argument("--frontier", type=int, default=4)
-    ap.add_argument("--rip-limit", type=int, default=8)
+    ap.add_argument("--sims", type=int, default=32, help="MCTS simulations per kick")
+    ap.add_argument("--moves", type=int, default=16, help="kicks per episode (as in training)")
+    ap.add_argument("--rounds", type=int, default=4,
+                    help="episodes per case, each from the best board so far (stops early "
+                         "once a whole-board episode finds nothing better)")
+    ap.add_argument("--settle", type=int, default=40)
+    ap.add_argument("--window", type=int, default=32)
+    ap.add_argument("--full-max-nets", type=int, default=110)
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--cleanup-seconds", type=float, default=60.0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
@@ -64,17 +68,17 @@ def main(argv=None):
     tasks = [{"suite_dir": suite_dir, "case": c, "cache_dir": None,
               "model_path": os.path.abspath(args.ckpt) if args.ckpt else None, "model_tag": 0,
               "device": args.device, "evaluator": args.evaluator, "sims": args.sims,
-              "c_puct": args.c_puct, "frontier": args.frontier, "rip_limit": args.rip_limit,
-              "cleanup_seconds": args.cleanup_seconds, "out": args.out,
+              "moves": args.moves, "rounds": args.rounds, "settle": args.settle,
+              "window": args.window, "full_max_nets": args.full_max_nets,
+              "c_puct": args.c_puct, "cleanup_seconds": args.cleanup_seconds, "out": args.out,
               "compile": args.compile} for c in cases]
     runtimes = {}
     runner = Runner(args.workers)
     try:
         for r in runner.imap(solve_case, tasks):
             runtimes[r["case"]] = r["seconds"]
-            search = f"{r['search']:.4f}" if r["search"] else "failed"
-            print(f"{r['case']}: {r['n']} nets  search {search}  final {r['final']:.4f}  "
-                  f"[{r['path']}]  {r['seconds']:.0f}s", flush=True)
+            print(f"{r['case']}: {r['n']} nets  start {r['start']:.4f}  search {r['search']:.4f}  "
+                  f"final {r['final']:.4f}  [{r['rounds']} round(s)]  {r['seconds']:.0f}s", flush=True)
     finally:
         runner.close()
 
@@ -87,8 +91,9 @@ def main(argv=None):
             json.dump({
                 "author": args.author,
                 "url": "",
-                "method": "GAT policy/value net + MCTS over per-net candidate routes "
-                          "(negotiated-router ref + SPT variants), rip-up repair, cleanup",
+                "method": "negotiated router + cleanup, then GAT policy/value net + MCTS over "
+                          "kick moves (re-route a net through others at a crossing penalty, "
+                          "re-route what it displaced, local settle), cleanup",
                 "date": datetime.date.today().isoformat(),
                 "hardware": f"{os.cpu_count()} CPU threads, GPU: {gpu}",
                 "threads": args.workers,

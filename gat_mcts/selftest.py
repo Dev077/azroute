@@ -69,19 +69,20 @@ def main(argv=None):
         from torch_geometric.data import Batch
         from .graph import build_graph
         from .model import RouteGAT
-        from .problem import Problem, State
+        from .problem import Board, Problem
+        from .selfplay import start_state
         c = load_manifest(tier_dir("hard"))["cases"][0]
         inst = Instance.load(os.path.join(tier_dir("hard"), c["instance_file"]))
         ref = Submission.load(os.path.join(tier_dir("hard"), c["reference_file"]))
         prob = Problem(inst, c["baseline_total"], reference=ref)
-        s = State.initial(prob)
-        fr, acts = s.actions(prob)
-        g = build_graph(prob, s, fr, acts)
+        board = Board(prob, start_state(prob, 5.0), moves=4)
+        acts = board.actions(board.start)
+        g = build_graph(board, board.start, acts, 0, board.start.delay)
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         m = RouteGAT().to(dev)
-        logits, v, l, _ = m(Batch.from_data_list([g, g]).to(dev))
-        (logits.sum() + v.sum() + l.sum()).backward()
-        prior, value, legal = m.evaluate(g, dev)
+        logits, v, _ = m(Batch.from_data_list([g, g]).to(dev))
+        (logits.sum() + v.sum()).backward()
+        prior, gain = m.evaluate(g, dev)
         assert len(prior) == len(acts) and abs(sum(prior) - 1) < 1e-4
 
     _step("environment + one network pass", env_check)
@@ -90,40 +91,43 @@ def main(argv=None):
          "--workers", w], cwd))
 
     def train_fresh():
-        _run(["gat_mcts.train", "--data", data, "--out", run, "--warm-episodes", "3",
-              "--warm-steps", "3", "--iters", "1", "--episodes", "2", "--sims", "2",
-              "--train-steps", "2", "--eval-every", "1", "--eval-cases", "1", "--eval-sims", "2",
+        _run(["gat_mcts.train", "--data", data, "--out", run, "--iters", "1", "--episodes", "2",
+              "--moves", "3", "--sims", "2", "--start-seconds", "2", "--train-steps", "2",
+              "--eval-every", "1", "--eval-cases", "1", "--eval-sims", "2",
               "--eval-cleanup", "1", "--full-max-nets", "0", "--window", "8", "--workers", w], cwd)
-        for f in ("warm.pt", "latest.pt", "iter_0000.pt", "best.pt", "best.json", "log.jsonl"):
+        for f in ("latest.pt", "iter_0000.pt", "best.pt", "best.json", "log.jsonl"):
             if not os.path.exists(os.path.join(run, f)):
                 raise RuntimeError(f"{f} was not written")
         recs = [json.loads(l) for l in open(os.path.join(run, "log.jsonl"))]
-        missing = {"warm", "warm_val", "warm_train", "selfplay", "iter", "eval"} - {r["kind"] for r in recs}
+        missing = {"eval_heuristic", "selfplay", "iter", "eval"} - {r["kind"] for r in recs}
         if missing:
             raise RuntimeError(f"log is missing {missing}")
         it = [r for r in recs if r["kind"] == "iter"][-1]
-        for k in ("loss", "grad_norm", "lr"):
+        for k in ("loss", "policy", "value", "grad_norm", "lr"):
             if not (isinstance(it.get(k), (int, float)) and it[k] == it[k] and abs(it[k]) != float("inf")):
                 raise RuntimeError(f"iteration log has a bad {k}: {it.get(k)}")
         if not it.get("fresh"):
             raise RuntimeError("iteration log has no unseen-data loss")
-        if not all(r.get("window") == 8 for r in recs if r["kind"] in ("warm", "selfplay")):
-            raise RuntimeError("--full-max-nets 0 --window 8: every episode should route a window of 8 nets")
-    _step("training: warm start, self-play, evaluation", train_fresh)
+        if not all(r.get("window") == 8 for r in recs if r["kind"] == "selfplay"):
+            raise RuntimeError("--full-max-nets 0 --window 8: every episode should kick a window of 8 nets")
+        if not all(r["score"] >= r["start"] - 1e-9 for r in recs if r["kind"] == "selfplay"):
+            raise RuntimeError("an episode's best board is worse than the board it started from")
+    _step("training: self-play, evaluation", train_fresh)
 
     def resume():
         _run(["gat_mcts.train", "--data", data, "--out", run, "--resume", os.path.join(run, "latest.pt"),
-              "--iters", "2", "--episodes", "1", "--sims", "2", "--train-steps", "2",
-              "--eval-every", "0", "--workers", w], cwd)
+              "--iters", "2", "--episodes", "1", "--moves", "3", "--sims", "2", "--train-steps", "2",
+              "--start-seconds", "2", "--eval-every", "0", "--workers", w], cwd)
         last = [json.loads(l) for l in open(os.path.join(run, "log.jsonl"))
                 if '"selfplay"' in l][-1]
         if last.get("window") is not None:
-            raise RuntimeError("small boards should play whole episodes by default")
+            raise RuntimeError("small boards should kick the whole board by default")
     _step("training: resume (whole-board episodes)", resume)
 
     def evaluate():
         out = _run(["gat_mcts.evaluate", "--tier", "hard", "--ckpt", os.path.join(run, "latest.pt"),
-                    "--cases", "case_01,case_02", "--sims", "2", "--cleanup-seconds", "1",
+                    "--cases", "case_01,case_02", "--sims", "2", "--moves", "2", "--rounds", "1",
+                    "--cleanup-seconds", "1",
                     "--workers", w, "--out", sub], cwd)
         if "legal 2/2" not in out:
             raise RuntimeError("evaluation did not produce 2 legal cases")
