@@ -166,6 +166,7 @@ class Trainer:
         gn = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         self.opt.step()
         self.steps += 1
+        loss = loss.detach()
         return {"loss": float(loss), "policy_kl": float((ce - ent).mean()), "policy_ent": float(ent.mean()),
                 "value_mse": float(loss_v), "blocked_bce": float(loss_b), "future_bce": float(loss_f),
                 "excess_mse": float(loss_e), "grad_norm": float(gn), "lr": self.opt.param_groups[0]["lr"],

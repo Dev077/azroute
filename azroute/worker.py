@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import random
 import time
 import traceback
@@ -98,13 +99,48 @@ class NetEvaluator:
         y = (out["y"].float() * self.model.y_sigma + self.model.y_mu).cpu().numpy()
         fb = torch.sigmoid(out["blocked"].float()).cpu().numpy()
         price = (torch.sigmoid(out["future"].float()) * 255).round().to(torch.uint8).cpu().numpy()
-        res = []
-        for i, st in enumerate(states):
-            lg = logits[i][decision_index(st)]
-            est = st.rerouted_delay + st.ideal_pending * math.exp(float(np.clip(y[i], -5, 5)))
-            q = (1 - fb[i]) * score_total(st, est) - fb[i]
-            res.append((lg, float(q), price[i]))
-        return res
+        return to_results(states, logits, y, fb, price)
+
+
+def to_results(states, logits, y, fb, price) -> List:
+    """Network outputs -> (logits over each state's legal decisions, q, price canvas) per state."""
+    res = []
+    for i, st in enumerate(states):
+        lg = logits[i][decision_index(st)]
+        est = st.rerouted_delay + st.ideal_pending * math.exp(float(np.clip(y[i], -5, 5)))
+        q = (1 - fb[i]) * score_total(st, est) - fb[i]
+        res.append((lg, float(q), price[i]))
+    return res
+
+
+class RemoteEvaluator:
+    """Evaluates states in the shared inference process (inference.py)."""
+
+    def __init__(self, wid: int, infer_q, resp_q, ready_flag: str):
+        self.wid, self.q, self.resp_q, self.flag = wid, infer_q, resp_q, ready_flag
+        self.rid = 0
+        self.ready = False
+
+    def refresh(self) -> None:
+        if not self.ready:
+            self.ready = os.path.exists(self.flag)
+
+    def __call__(self, states) -> Optional[List]:
+        """Results, or None if the inference process does not answer (the caller then falls back
+        to the network-free evaluator and this worker stops using the network)."""
+        self.rid += 1
+        self.q.put(("eval", self.wid, self.rid, [encode(st.problem, st) for st in states]))
+        while True:
+            try:
+                rid, logits, y, fb, price = self.resp_q.get(timeout=120)
+            except queue.Empty:
+                self.ready, self.flag = False, "/nonexistent"
+                return None
+            if rid == self.rid:
+                break
+        if logits is None:
+            return None
+        return to_results(states, logits, y, fb, price)
 
 
 class Slot:
@@ -142,29 +178,40 @@ class Slot:
                 self.gen, reply = None, None
 
 
-def worker_main(wid: int, cfg: Dict, req_q, resp_q) -> None:
+def worker_main(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     try:
-        _worker(wid, cfg, req_q, resp_q)
+        _worker(wid, cfg, req_q, resp_q, infer_q, infer_resp_q)
     except Exception:
         req_q.put(("error", wid, traceback.format_exc()))
         raise
 
 
-def _worker(wid: int, cfg: Dict, req_q, resp_q) -> None:
+def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     import torch
     torch.set_num_threads(1)
     device = torch.device("cuda" if torch.cuda.is_available() and not cfg.get("cpu") else "cpu")
     work = cfg["work"]
     rng = random.Random(cfg["seed"] * 1000 + wid)
-    net = NetEvaluator(os.path.join(work, "model.pt"), device)
+    net = RemoteEvaluator(wid, infer_q, infer_resp_q, os.path.join(work, "net_ready"))
     cache: "OrderedDict[str, Problem]" = OrderedDict()
     slots: List[Slot] = []
     shard = 0
     stop_flag = cfg["stop_flag"]
+    parent = os.getppid()
+
+    def orphaned() -> bool:
+        """The run process died (killed or crashed): this worker must not keep writing."""
+        return os.getppid() != parent
 
     def acquire() -> Optional[Slot]:
         req_q.put(("get", wid))
-        key = resp_q.get()
+        while True:
+            try:
+                key = resp_q.get(timeout=10)
+                break
+            except queue.Empty:
+                if orphaned():
+                    raise SystemExit(0)
         if key is None:
             return None
         t0 = time.time()
@@ -230,6 +277,8 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q) -> None:
 
     completion = {}
     while not os.path.exists(stop_flag):
+        if orphaned():
+            return
         net.refresh()
         while len(slots) < cfg["concurrency"] and not os.path.exists(stop_flag):
             s = acquire()
@@ -243,9 +292,8 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q) -> None:
             time.sleep(1.0)
             continue
         states = [s.pending_req for s in slots]
-        if net.ready:
-            results = net(states)
-        else:
+        results = net(states) if net.ready else None
+        if results is None:
             results = []
             for s, st in zip(slots, states):
                 ev = completion.setdefault(id(s.imp), completion_evaluator(s.imp))

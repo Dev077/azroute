@@ -168,6 +168,7 @@ back to DELAY if blocked.
 | wall time | 23.5 h including export (kept across resumes) | `--hours` |
 | reserved for stop + export | 20 min | `--export-minutes` |
 | Drive sync | every 30 min | `--sync-minutes` |
-| workers | min(CPUs - 1, 32, (free RAM GB - 8) / 3, 0.55 x GPU GB) | `--workers` |
+| workers | min(CPUs - 4, 64, (free RAM GB - 16) / 3, 0.55 x GPU GB); 44 on a G4 (48 CPUs) | `--workers` |
 | cases per worker at once | min(4, #cases / workers) | `--concurrency` |
+| network evaluation | one inference process holds the network on the GPU; workers send encoded states, it batches whatever is pending (up to 256, 2 ms gather window) and reloads weights every 2 s if the learner published | |
 | network | preset `default` (10.33 M), `small` (3.83 M), `tiny` | `--model` |

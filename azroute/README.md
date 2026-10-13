@@ -42,7 +42,7 @@ initial routing (`lns.replay`).
 | `features.py`, `model.py` | network inputs (incl. pair conflict features); the network |
 | `docs/` | architecture diagram, loss and every setting (`ARCHITECTURE.md`); what to expect from a run (`RUN_EXPECTATIONS.md`) |
 | `learner.py` | replay buffer, symmetry augmentation, loss |
-| `worker.py`, `run.py` | worker processes and the orchestrator (dispatch, training, Drive sync, deadline) |
+| `worker.py`, `inference.py`, `run.py` | worker processes; the single process that runs the network for all workers (batched); the orchestrator (dispatch, training, Drive sync, deadline) |
 | `export.py` | checked submission files, `runtime.json`, summary |
 | `colab_train.ipynb` | the Colab notebook |
 

@@ -51,12 +51,23 @@ trained network makes the search beat greedy rerouting.
 | 2-24 h | network-guided search on every visit; the network is republished every 250 steps; learning rate drops x0.3 at 70 % and x0.1 at 90 % of the run |
 | last 20 min | workers stop, state is synced to Drive, checked submissions are exported |
 
+## Lesson from the first G4 run
+
+With one copy of the network per worker (44 processes on one GPU), the records rate fell from
+~240/s to ~0.6/s the moment the network was handed over, and a training step went from ~0.4 s
+to ~5 s: the GPU spent its time switching between processes. Since then a single inference
+process batches all workers' evaluations. Expect the records rate to drop when the network takes
+over (each record now needs ~90 network calls instead of rule-based completions), but to tens
+per second, not below one; `run.log` prints the inference rate every 5 minutes
+(`inference: N evals/s, mean batch B`).
+
 ## What to watch (notebook cell 6)
 
 | signal | healthy | if not |
 |---|---|---|
 | `run.log` first line | sensible workers / batch / buffer for the G4 | set `--workers` / `--batch` |
 | `network published to workers at step 1000` | within ~2 h | record rate is low: lower `--n-full` (e.g. 32) or `--min-records` |
+| `records=` in the 5-minute status lines after the handoff | grows by thousands per 5 min | grows by hundreds: inference is the bottleneck; check `inference: N evals/s` and GPU utilisation |
 | `nvidia-smi` GPU utilisation | anything; low is fine | low with idle workers: more workers; pinned at 100 % with slow visits: `--model small` |
 | training losses | policy KL and value MSE fall over the first hours, then flatten | flat from the start: the network is not learning; the run still improves routings via greedy rerouting |
 | share of search reroutes that improve | network bar rises above the network-free bar within a few hours | stays below: learned search is not paying off on this budget |

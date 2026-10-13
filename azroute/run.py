@@ -30,7 +30,7 @@ def log(msg: str) -> None:
 
 
 def sync(src: str, dst: str) -> None:
-    """Copy run state from src to dst (files whose size/mtime differ)."""
+    """Copy run state from src to dst: files missing in dst or newer in src (never older over newer)."""
     if not dst:
         return
     os.makedirs(dst, exist_ok=True)
@@ -43,9 +43,9 @@ def sync(src: str, dst: str) -> None:
                     continue
                 fs, fd = os.path.join(s, f), os.path.join(d, f)
                 st = os.stat(fs)
-                if not os.path.exists(fd) or os.stat(fd).st_size != st.st_size or os.stat(fd).st_mtime < st.st_mtime:
+                if not os.path.exists(fd) or st.st_mtime > os.stat(fd).st_mtime + 1:
                     shutil.copy2(fs, fd)
-        elif os.path.exists(s):
+        elif os.path.exists(s) and (not os.path.exists(d) or os.stat(s).st_mtime > os.stat(d).st_mtime + 1):
             shutil.copy2(s, d + ".tmp")
             os.replace(d + ".tmp", d)
 
@@ -62,7 +62,7 @@ def auto_workers(requested: int, gpu_gb: float) -> int:
     except Exception:
         ram_gb = 12.0
     gpu_cap = int(gpu_gb * 0.55) if gpu_gb else 64
-    return int(max(1, min(cpus - 1, 32, (ram_gb - 8) // 3, gpu_cap)))
+    return int(max(1, min(cpus - 4, 64, (ram_gb - 16) // 3, gpu_cap)))
 
 
 def main(argv=None) -> None:
@@ -108,8 +108,9 @@ def main(argv=None) -> None:
     if a.drive and os.path.isdir(a.drive):
         log(f"resuming from {a.drive}")
         sync(a.drive, work)
-    if os.path.exists(os.path.join(work, "STOP")):
-        os.remove(os.path.join(work, "STOP"))
+    for f in ("STOP", "net_ready"):
+        if os.path.exists(os.path.join(work, f)):
+            os.remove(os.path.join(work, f))
     prev_cfg_path = os.path.join(work, "run_config.json")
     prev_deadline = None
     if a.hours is None and os.path.exists(prev_cfg_path):
@@ -177,8 +178,12 @@ def main(argv=None) -> None:
     records_in = 0
     net_ready = trainer.steps >= a.warmup_steps
 
+    ready_flag = os.path.join(work, "net_ready")
+
     def publish():
         save_model(model, model_path, {"net_ready": net_ready, "steps": trainer.steps})
+        if net_ready and not os.path.exists(ready_flag):
+            open(ready_flag, "w").close()      # workers switch to the inference process
 
     if net_ready:
         publish()
@@ -198,7 +203,13 @@ def main(argv=None) -> None:
     req_q = ctx.Queue()
     resp_qs = [ctx.Queue() for _ in range(W)]
     from .worker import worker_main
-    procs = [ctx.Process(target=worker_main, args=(i, cfg, req_q, resp_qs[i]), daemon=True) for i in range(W)]
+    infer_q = ctx.Queue()
+    infer_resp_qs = [ctx.Queue() for _ in range(W)]
+    from .inference import inference_main
+    infer_proc = ctx.Process(target=inference_main, args=(cfg, infer_q, infer_resp_qs, req_q), daemon=True)
+    infer_proc.start()
+    procs = [ctx.Process(target=worker_main, args=(i, cfg, req_q, resp_qs[i], infer_q, infer_resp_qs[i]),
+                         daemon=True) for i in range(W)]
     for p in procs:
         p.start()
 
@@ -246,10 +257,13 @@ def main(argv=None) -> None:
             stats[msg[1]].update(msg[2])
             stats[msg[1]]["best"] = msg[2]["initial_delay"]
         elif kind == "log":
-            log(f"worker {msg[1]}: {msg[2]}")
+            log(f"{msg[1] if isinstance(msg[1], str) else 'worker ' + str(msg[1])}: {msg[2]}")
         elif kind == "error":
-            log(f"worker {msg[1]} crashed:\n{msg[2]}")
-            exited += 1
+            if msg[1] == "inference":
+                log(f"inference process crashed (workers fall back to network-free search):\n{msg[2]}")
+            else:
+                log(f"worker {msg[1]} crashed:\n{msg[2]}")
+                exited += 1
         elif kind == "exit":
             exited += 1
 
@@ -329,6 +343,8 @@ def main(argv=None) -> None:
             log("synced to drive")
     for p in procs:
         p.join(timeout=60)
+    infer_q.put(None)
+    infer_proc.join(timeout=30)
     save_all()
     sync(work, a.drive)
     log(f"stopped. {summary()}")
