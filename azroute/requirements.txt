@@ -1,0 +1,4 @@
+# azroute only; the m3d toolkit itself stays pure standard library.
+numpy>=1.24
+pybind11>=2.11
+torch>=2.2

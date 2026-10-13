@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1340" height="1204" viewBox="0 0 1340 1204" font-family="Helvetica, Arial, sans-serif">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#495057"/></marker>
+<style>.t{font-size:14px;font-weight:700;fill:#212529} .l{font-size:12px;fill:#343a40} .loss{font-size:12px;font-weight:700;fill:#d9480f}
+.sec{font-size:12px;font-weight:700;letter-spacing:1px;fill:#868e96} .lab{font-size:11px;fill:#495057;font-style:italic}
+.lf{font-size:13px;fill:#343a40} .lfb{font-size:13px;font-weight:700;fill:#212529} .h{font-size:20px;font-weight:700;fill:#212529}</style></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="30" y="30" class="h">azroute network (current defaults)</text>
+<text x="30" y="52" class="sec">GRID STREAM (multi-scale CNN)</text>
+<text x="470" y="52" class="sec">NET STREAM (one node per net, one pair per net pair)</text>
+<text x="960" y="52" class="sec">WHOLE-REROUTE</text>
+<rect x="30" y="66" width="380" height="148" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="40" y="87" class="t">Region canvas  (uint8 bit field)</text>
+<text x="40" y="106" class="l">6 layers x 64 x 64 (region max-pooled if &gt; 64 cells)</text>
+<text x="40" y="122" class="l">bit 0  occupied by a fixed net</text>
+<text x="40" y="138" class="l">bit 1  occupied by an already-rerouted net</text>
+<text x="40" y="154" class="l">bit 2  pin of a fixed net</text>
+<text x="40" y="170" class="l">bit 3  pin of a pending net</text>
+<text x="40" y="186" class="l">bit 4  previous route of a pending net (KEEP)</text>
+<text x="40" y="202" class="l">bit 5  inside the region</text>
+<rect x="30" y="228" width="380" height="52" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="40" y="249" class="t">Layer + via delays</text>
+<text x="40" y="268" class="l">7 values / max delay</text>
+<rect x="470" y="66" width="410" height="84" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="480" y="87" class="t">Net features   16 x 24</text>
+<text x="480" y="106" class="l">pending / rerouted / seed flags, log fanout, dies,</text>
+<text x="480" y="122" class="l">box size &amp; centre, ideal share, log(old / ideal),</text>
+<text x="480" y="138" class="l">log(new / ideal), mode one-hot (7), demand, valid</text>
+<rect x="470" y="162" width="410" height="52" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="480" y="183" class="t">Net boxes   16 x 4</text>
+<text x="480" y="202" class="l">pin bounding box on the canvas</text>
+<rect x="470" y="226" width="410" height="84" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="480" y="247" class="t">Pair conflicts   16 x 16 x 3  (exact, from the router)</text>
+<text x="480" y="266" class="l">share of net i's ideal tree that net j</text>
+<text x="480" y="282" class="l">  occupies now / would occupy if kept /</text>
+<text x="480" y="298" class="l">  blocks in the via columns above its pins</text>
+<rect x="470" y="322" width="410" height="52" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="480" y="343" class="t">Legal decisions   16 x 7</text>
+<text x="480" y="362" class="l">pending nets x 7 modes</text>
+<rect x="960" y="66" width="330" height="68" rx="8" fill="#f1f3f5" stroke="#868e96" stroke-width="1.6"/>
+<text x="970" y="87" class="t">Reroute features   6</text>
+<text x="970" y="106" class="l">log(old / ideal), slack, progress,</text>
+<text x="970" y="122" class="l">canvas scale, #pending, #nets</text>
+<rect x="30" y="330" width="380" height="68" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="351" class="t">Input planes   46 x 64 x 64</text>
+<text x="40" y="370" class="l">36 bit planes, 7 delay planes, 1 demand,</text>
+<text x="40" y="386" class="l">2 coordinates</text>
+<rect x="30" y="420" width="380" height="52" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="441" class="t">64 x 64   stem + 2 residual blocks, 96 ch</text>
+<text x="40" y="460" class="l">conv 3x3 46 -&gt; 96; blocks: conv 3x3, BN, ReLU, conv 3x3, BN, + skip</text>
+<rect x="30" y="494" width="380" height="52" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="515" class="t">32 x 32   stride-2 conv + 3 blocks, 160 ch</text>
+<text x="40" y="534" class="l">blocks add region-wide context (mean &amp; max pool -&gt; bias)</text>
+<rect x="30" y="568" width="380" height="52" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="589" class="t">16 x 16   stride-2 conv + 3 blocks, 224 ch</text>
+<text x="40" y="608" class="l">each cell sees the whole region; + region context</text>
+<rect x="30" y="642" width="380" height="52" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="663" class="t">32 x 32   upsample + skip + 1 block, 160 ch</text>
+<text x="40" y="682" class="l">-&gt; grid read by the nets (2 x 2 cells per token)</text>
+<rect x="30" y="716" width="380" height="52" rx="8" fill="#e7f0fb" stroke="#3b6fb6" stroke-width="1.6"/>
+<text x="40" y="737" class="t">64 x 64   upsample + skip + 1 block, 96 ch</text>
+<text x="40" y="756" class="l">full-resolution features; backbone 6.12 M params</text>
+<rect x="470" y="494" width="410" height="52" rx="8" fill="#fff6e5" stroke="#c28a17" stroke-width="1.6"/>
+<text x="480" y="515" class="t">Box-mean pooling</text>
+<text x="480" y="534" class="l">each net: mean of 64 x 64 features over its box -&gt; 96</text>
+<rect x="470" y="568" width="410" height="68" rx="8" fill="#f1eafa" stroke="#7048b8" stroke-width="1.6"/>
+<text x="480" y="589" class="t">Initial states</text>
+<text x="480" y="608" class="l">nets  h: [net 24 | reroute 6 | pooled 96] -&gt; 256</text>
+<text x="480" y="624" class="l">pairs z: [geometry 6 | conflict i,j 3 | j,i 3] -&gt; 64</text>
+<rect x="470" y="658" width="410" height="164" rx="8" fill="#f1eafa" stroke="#7048b8" stroke-width="1.6"/>
+<text x="480" y="679" class="t">Net interaction layer  x 3     (8 heads)</text>
+<text x="480" y="698" class="l">1  grid read: net attends over the 1024 grid tokens,</text>
+<text x="480" y="714" class="l">   biased to its own box (learned outside penalty)</text>
+<text x="480" y="730" class="l">2  pair update: z_ij += f(h_i) + g(h_j) + overlap of</text>
+<text x="480" y="746" class="l">   i's and j's grid attention;  z += MLP(z)</text>
+<text x="480" y="762" class="l">3  net exchange: attention among nets with bias(z_ij);</text>
+<text x="480" y="778" class="l">   message from j to i = v_j + W z_ij</text>
+<text x="480" y="794" class="l">4  feed-forward 256 -&gt; 1024 -&gt; 256</text>
+<text x="480" y="810" class="l">pre-LayerNorm residuals; 3.36 M params</text>
+<rect x="470" y="844" width="410" height="34" rx="8" fill="#f1eafa" stroke="#7048b8" stroke-width="1.6"/>
+<text x="480" y="865" class="t">Net embeddings   16 x 256   (+ pair vectors 16 x 16 x 64)</text>
+<rect x="960" y="404" width="330" height="68" rx="8" fill="#fff6e5" stroke="#c28a17" stroke-width="1.6"/>
+<text x="970" y="425" class="t">Grid tokens   32 x 32 = 1024</text>
+<text x="970" y="444" class="l">from the 32 x 32 decoder: Linear 160 -&gt; 256</text>
+<text x="970" y="460" class="l">+ learned position</text>
+<rect x="960" y="568" width="330" height="52" rx="8" fill="#fff6e5" stroke="#c28a17" stroke-width="1.6"/>
+<text x="970" y="589" class="t">Region mean pooling</text>
+<text x="970" y="608" class="l">mean of 16 x 16 features -&gt; 224</text>
+<rect x="960" y="784" width="330" height="84" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="970" y="805" class="t">Trunk</text>
+<text x="970" y="824" class="l">[attention-pool nets 256 | max nets 256 |</text>
+<text x="970" y="840" class="l"> region pool 224 | reroute 6] = 742</text>
+<text x="970" y="856" class="l">-&gt; 256 -&gt; 256 (GELU)</text>
+<rect x="30" y="938" width="380" height="100" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="40" y="959" class="t">Future-occupancy head</text>
+<text x="40" y="978" class="l">conv 3x3 96 -&gt; 96, ReLU, conv 1x1 -&gt; 6</text>
+<text x="40" y="994" class="l">6 x 64 x 64 logits: cell used by a later net</text>
+<text x="40" y="1010" class="l">sigmoid -&gt; price canvas for LEARNED_PRICE</text>
+<text x="40" y="1026" class="loss">loss: 0.5 x BCE per region cell</text>
+<rect x="470" y="938" width="200" height="100" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="480" y="959" class="t">Decision head</text>
+<text x="480" y="978" class="l">per net 256-&gt;256-&gt;7</text>
+<text x="480" y="994" class="l">illegal -&gt; -inf</text>
+<text x="480" y="1010" class="l">flatten -&gt; 112 logits</text>
+<text x="480" y="1026" class="loss">loss: KL(pi' || p)</text>
+<rect x="680" y="938" width="200" height="100" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="690" y="959" class="t">Net-excess head</text>
+<text x="690" y="978" class="l">per net 256-&gt;128-&gt;1</text>
+<text x="690" y="994" class="l">log(final / ideal)</text>
+<text x="690" y="1010" class="l"></text>
+<text x="690" y="1026" class="loss">loss: 0.25 x MSE</text>
+<rect x="960" y="938" width="160" height="100" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="970" y="959" class="t">Value head</text>
+<text x="970" y="978" class="l">Linear 256 -&gt; 1</text>
+<text x="970" y="994" class="l">y = standardised</text>
+<text x="970" y="1010" class="l">log(D_rem / LB_rem)</text>
+<text x="970" y="1026" class="loss">loss: MSE</text>
+<rect x="1130" y="938" width="160" height="100" rx="8" fill="#e8f6ec" stroke="#2f8a4c" stroke-width="1.6"/>
+<text x="1140" y="959" class="t">Blocked head</text>
+<text x="1140" y="978" class="l">Linear 256 -&gt; 1</text>
+<text x="1140" y="994" class="l">logit: reroute</text>
+<text x="1140" y="1010" class="l">ends blocked</text>
+<text x="1140" y="1026" class="loss">loss: 0.5 x BCE</text>
+<polyline points="30,140.0 16,140.0 16,350 30,350" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,280 220.0,330" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,398 220.0,420" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,472 220.0,494" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,546 220.0,568" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,620 220.0,642" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="220.0,694 220.0,716" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="30,446.0 8,446.0 8,742.0 30,742.0" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="30,520.0 20,520.0 20,668.0 30,668.0" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="470,188.0 445,188.0 445,370 410,370" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="433.5" y="366.0" class="lab">demand</text>
+<polyline points="60,768 60,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="410,742.0 440,742.0 440,520.0 470,520.0" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="410,668.0 450,668.0 450,426 960,426" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="410,594.0 458,594.0 458,483.0 1000,483.0 1000,568" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="675.0,546 675.0,568" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="880,90 898,90 898,586 880,586" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="880,268.0 912,268.0 912,604 880,604" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="990,134 990,148 946,148 946,576 880,576" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="919.0" y="572.0" class="lab">reroute</text>
+<polyline points="675.0,636 675.0,658" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="880,188.0 926,188.0 926,682 880,682" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="909.0" y="678.0" class="lab">boxes</text>
+<polyline points="1290,438.0 1304,438.0 1304,718 880,718" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="1098.0" y="714.0" class="lab">grid tokens</text>
+<polyline points="675.0,822 675.0,844" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="570,878 570,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="780,878 780,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="880,861.0 960,861.0" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="1125.0,620 1125.0,784" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="1290,100.0 1320,100.0 1320,804 1290,804" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="880,348.0 940,348.0 940,914 570,914 570,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="576.0" y="922.0" class="lab">mask</text>
+<polyline points="1040,868 1040,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<polyline points="1210,868 1210,938" fill="none" stroke="#495057" stroke-width="1.4" marker-end="url(#ah)"/>
+<rect x="30" y="1088" width="1260" height="92" rx="8" fill="#fff4e6" stroke="#d9480f" stroke-width="1.6"/>
+<text x="42" y="1112" class="lfb">Total loss = KL(pi' || p) + (y_std - y)^2 + 0.5 BCE(blocked) + 0.5 BCE(future) + 0.25 (net excess)^2,  AdamW weight decay 1e-4</text>
+<text x="42" y="1131" class="lf">value, future and excess terms only on reroutes that completed;  pi' = search's improved decision distribution</text>
+<text x="42" y="1150" class="lf">In search:  q = (1 - P_blocked) * clip((old - (rerouted + LB_pending * exp(y))) / slack, -1, 1) - P_blocked</text>
+<text x="42" y="1169" class="lf">Total: 10.33 M parameters (backbone 6.12 M, net interaction 3.36 M, grid tokens 0.30 M, inputs/heads/trunk 0.54 M);  11.9 GFLOPs per sample</text>
+</svg>
