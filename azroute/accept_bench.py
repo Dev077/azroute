@@ -25,14 +25,16 @@ from .tiers import cases
 from .worker import load_routing, save_routing
 
 
-def make_rule(name: str, a) -> Acceptance:
-    if name == "strict":
+def make_rule(spec: str, a) -> Acceptance:
+    """strict | rrt[:tau] | lahc[:length]; without a value, --tau / --lahc apply."""
+    name, _, val = spec.partition(":")
+    if name == "strict" and not val:
         return Acceptance()
     if name == "rrt":
-        return RecordToRecord(a.tau, a.seconds)
+        return RecordToRecord(float(val) if val else a.tau, a.seconds)
     if name == "lahc":
-        return LateAcceptance(a.lahc)
-    raise ValueError(f"unknown rule {name!r} (strict, rrt, lahc)")
+        return LateAcceptance(int(val) if val else a.lahc)
+    raise ValueError(f"unknown rule {spec!r} (strict, rrt[:tau], lahc[:length])")
 
 
 def prepare(job):
@@ -95,7 +97,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tier", default="hard")
     ap.add_argument("--cases", default="", help="comma-separated case indices (default: all)")
-    ap.add_argument("--rules", default="strict,rrt,lahc")
+    ap.add_argument("--rules", default="strict,rrt,lahc", help="e.g. strict,rrt:0.006,lahc:5000")
     ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--seconds", type=float, default=600, help="rerouting time per case and rule")
     ap.add_argument("--from", dest="src", default="", help="run work/Drive folder with state/*.npz to start from")
@@ -132,7 +134,7 @@ def main(argv=None) -> None:
                 rows.append(row)
                 f.write(json.dumps(row) + "\n")
                 f.flush()
-                print(f"{row['case']:>12s} {row['rule']:6s} seed {row['seed']}: {row['start']} -> {row['best']} "
+                print(f"{row['case']:>12s} {row['rule']:10s} seed {row['seed']}: {row['start']} -> {row['best']} "
                       f"({100 * (row['start'] - row['best']) / row['start']:.2f}%)  reroutes={row['reroutes']} "
                       f"kept better/equal/worse={row['kept_better']}/{row['kept_equal']}/{row['kept_worse']}",
                       flush=True)
@@ -141,11 +143,11 @@ def main(argv=None) -> None:
         return math.exp(sum(math.log(r["baseline"] / r[key]) for r in rs) / len(rs))
 
     print(f"\n{a.tier}: {len(chosen)} cases, {a.seconds:.0f} s per case, move={a.move}")
-    print(f"{'rule':8s} {'start':>8s} {'best':>8s} {'gain':>7s} {'reroutes':>9s}")
+    print(f"{'rule':10s} {'start':>8s} {'best':>8s} {'gain':>7s} {'reroutes':>9s}")
     for r in rules:
         rs = [x for x in rows if x["rule"] == r]
         s0, s1 = gm(rs, "start"), gm(rs, "best")
-        print(f"{r:8s} {s0:8.4f} {s1:8.4f} {100 * (s1 / s0 - 1):6.2f}% {sum(x['reroutes'] for x in rs) / len(rs):9.0f}")
+        print(f"{r:10s} {s0:8.4f} {s1:8.4f} {100 * (s1 / s0 - 1):6.2f}% {sum(x['reroutes'] for x in rs) / len(rs):9.0f}")
 
 
 if __name__ == "__main__":
