@@ -65,6 +65,23 @@ def auto_workers(requested: int, gpu_gb: float) -> int:
     return int(max(1, min(cpus - 4, 64, (ram_gb - 16) // 3, gpu_cap)))
 
 
+def load_gen_cases(dirs: str) -> dict:
+    """Generated training-only cases: {"gen/<folder>_<stem>": (instance path, reference .sol.json)}
+    for every <stem>.json in each folder that has a <stem>.ref.sol.json next to it."""
+    out = {}
+    for d in [x for x in dirs.split(",") if x.strip()]:
+        d = d.strip()
+        tag = os.path.basename(os.path.normpath(d))
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".json") or f.count(".") != 1 or f == "index.json":
+                continue
+            stem = f[:-5]
+            ref = os.path.join(d, stem + ".ref.sol.json")
+            if os.path.exists(ref):
+                out[f"gen/{tag}_{stem}"] = (os.path.join(d, f), ref)
+    return out
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default="/content/work")
@@ -77,11 +94,26 @@ def main(argv=None) -> None:
     ap.add_argument("--concurrency", type=int, default=0, help="cases per worker; 0 = auto")
     ap.add_argument("--batch", type=int, default=0, help="training batch; 0 = auto from GPU memory")
     ap.add_argument("--buffer", type=int, default=0, help="replay capacity; 0 = auto from RAM")
-    ap.add_argument("--replay-ratio", type=float, default=8.0, help="max samples trained per record collected")
+    ap.add_argument("--replay-ratio", type=float, default=16.0, help="max samples trained per record collected")
+    ap.add_argument("--prio", type=float, default=0.5,
+                    help="share of each batch drawn in proportion to the record's decision spread")
+    ap.add_argument("--gen-dirs", default="", help="comma list of folders of generated training-only cases")
+    ap.add_argument("--gen-share", type=float, default=0.5, help="share of visits given to generated cases")
+    ap.add_argument("--control-share", type=float, default=0.1,
+                    help="share of visits that stay network-free after the handoff (for comparison)")
+    ap.add_argument("--gumbel-scale", type=float, default=1.0,
+                    help="exploration noise on the decision scores (higher = tries less likely decisions more)")
+    ap.add_argument("--considered", type=int, default=32, help="candidate decisions sampled per full search")
+    ap.add_argument("--considered-fast", type=int, default=16, help="candidate decisions sampled per fast search")
+    ap.add_argument("--no-explore-fast", dest="explore_fast", action="store_false",
+                    help="no Gumbel noise on fast (unrecorded) searches")
+    ap.add_argument("--k-max", type=int, default=8, help="max nets per neighbourhood on a case that improves")
+    ap.add_argument("--k-max-stalled", type=int, default=16,
+                    help="max nets per neighbourhood once a case stops improving (+2 per visit without gain)")
     ap.add_argument("--min-records", type=int, default=2000)
     ap.add_argument("--warmup-steps", type=int, default=1000, help="train steps before workers switch to the network")
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--n-full", type=int, default=64)
+    ap.add_argument("--n-full", type=int, default=128, help="evaluations per recorded (full) decision")
     ap.add_argument("--n-fast", type=int, default=8)
     ap.add_argument("--p-full", type=float, default=0.25)
     ap.add_argument("--model", default="default", choices=["default", "small", "tiny"],
@@ -103,7 +135,7 @@ def main(argv=None) -> None:
         a.tiers = a.tiers if a.tiers != "all" else "hard"
 
     work = os.path.abspath(a.work)
-    for d in ("state", "records"):
+    for d in ("state", "gen_state", "records"):
         os.makedirs(os.path.join(work, d), exist_ok=True)
     if a.drive and os.path.isdir(a.drive):
         log(f"resuming from {a.drive}")
@@ -131,11 +163,14 @@ def main(argv=None) -> None:
     if a.smoke:
         cases = cases[:2]
     base = {f"{t}/{n}": b for (t, n, _p, b) in all_cases()}
+    gen_cases = load_gen_cases(a.gen_dirs) if a.gen_dirs else {}
+    if a.gen_dirs:
+        log(f"{len(gen_cases)} generated training cases from {a.gen_dirs}")
 
     device = torch.device("cuda" if torch.cuda.is_available() and not a.cpu else "cpu")
     gpu_gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30 if device.type == "cuda" else 0.0
     W = auto_workers(a.workers, gpu_gb) if not a.smoke else 2
-    C = a.concurrency or max(1, min(4, len(cases) // W))
+    C = a.concurrency or max(1, min(2, (len(cases) + len(gen_cases)) // W))
     if a.batch:
         batch = a.batch
     elif device.type == "cuda":
@@ -148,20 +183,22 @@ def main(argv=None) -> None:
         avail = psutil.virtual_memory().available
     except Exception:
         avail = 12 * 2 ** 30
-    cap = a.buffer or int(min(400_000, max(20_000, 0.2 * avail / 30_000)))
+    cap = a.buffer or int(min(1_000_000, max(20_000, 0.2 * avail / 30_000)))   # ~30 KB per record
     if a.smoke:
         cap = 5_000
 
     cfg = {"work": work, "seed": a.seed, "stop_flag": os.path.join(work, "STOP"), "cpu": a.cpu,
            "concurrency": C, "cache_cases": max(2, C + 1), "stall_tries": 200, "greedy_seconds": 15.0,
            "min_excess": 0.003, "max_search": 64 if not a.smoke else 3, "n_full": a.n_full,
-           "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": 1.0, "k_min": 3, "k_max": 8}
+           "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": a.gumbel_scale, "considered": a.considered,
+           "considered_fast": a.considered_fast, "k_min": 3, "k_max": a.k_max,
+           "control_share": a.control_share, "explore_fast": a.explore_fast, "gen_cases": gen_cases}
     run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C, batch=batch, buffer=cap, device=str(device),
-                   cases=len(cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
+                   cases=len(cases), gen_cases=len(gen_cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
                    cpus=os.cpu_count())
     json.dump(run_cfg, open(os.path.join(work, "run_config.json"), "w"), indent=1)
     log(f"device={device} gpu={run_cfg['gpu']} cpus={os.cpu_count()} workers={W} concurrency={C} "
-        f"batch={batch} buffer={cap} cases={len(cases)}")
+        f"batch={batch} buffer={cap} cases={len(cases)} gen_cases={len(gen_cases)}")
 
     # -- learner -------------------------------------------------------------------
     model_path = os.path.join(work, "model.pt")
@@ -220,6 +257,8 @@ def main(argv=None) -> None:
         p.start()
 
     order: list = []
+    gen_order: list = []
+    gen_rng = random.Random(a.seed + 1)
     busy: set = set()
     exited = 0
     metrics_f = open(os.path.join(work, "metrics.jsonl"), "a")
@@ -229,8 +268,18 @@ def main(argv=None) -> None:
     learner_seconds0 = meta["learner_seconds"]
     stopping = False
 
+    def gen_stats(k):
+        return {"tier": "gen", "case": k[4:], "baseline": None, "seconds": 0.0, "visits": 0, "records": 0}
+
     def next_case():
-        nonlocal order
+        nonlocal order, gen_order
+        if gen_cases and gen_rng.random() < a.gen_share:
+            for _ in range(2):
+                for i, k in enumerate(gen_order):
+                    if k not in busy:
+                        gen_order.pop(i)
+                        return k
+                gen_order = gen_order + gen_rng.sample(list(gen_cases), len(gen_cases))
         for _ in range(2):
             for i, k in enumerate(order):
                 if k not in busy:
@@ -245,13 +294,18 @@ def main(argv=None) -> None:
         if kind == "get":
             wid = msg[1]
             k = None if stopping else next_case()
-            if k is not None:
+            if k is None:
+                resp_qs[wid].put(None)
+            else:
                 busy.add(k)
-            resp_qs[wid].put(k)
+                stall = stats.get(k, {}).get("stall", 0)
+                resp_qs[wid].put((k, {"k_max": min(a.k_max_stalled, a.k_max + 2 * stall) if stall else a.k_max}))
         elif kind == "done":
             k, st = msg[1], msg[2]
             busy.discard(k)
-            s = stats[k]
+            s = stats.setdefault(k, gen_stats(k))
+            if "delay" in st and "start" in st:
+                s["stall"] = 0 if st["delay"] < st["start"] else s.get("stall", 0) + 1
             s["seconds"] += st.get("seconds", 0.0)
             s["visits"] += 1
             s["records"] += st.get("records", 0)
@@ -260,7 +314,7 @@ def main(argv=None) -> None:
             visits_f.write(json.dumps({"t": time.time(), "case": k, **st}) + "\n")
             visits_f.flush()
         elif kind == "init":
-            stats[msg[1]].update(msg[2])
+            stats.setdefault(msg[1], gen_stats(msg[1])).update(msg[2])
             stats[msg[1]]["best"] = msg[2]["initial_delay"]
         elif kind == "log":
             log(f"{msg[1] if isinstance(msg[1], str) else 'worker ' + str(msg[1])}: {msg[2]}")
@@ -289,8 +343,9 @@ def main(argv=None) -> None:
 
     def summary() -> str:
         parts = []
-        for t in tiers:
-            rs = [s for k, s in stats.items() if not k.startswith("_") and s["tier"] == t and s.get("best")]
+        for t in tiers + (["gen"] if gen_cases else []):
+            rs = [s for k, s in stats.items() if not k.startswith("_") and s["tier"] == t and s.get("best")
+                  and s.get("baseline")]
             if rs:
                 gm = math.exp(sum(math.log(s["baseline"] / s["best"]) for s in rs) / len(rs))
                 parts.append(f"{t}={gm:.4f}({len(rs)})")
@@ -324,7 +379,7 @@ def main(argv=None) -> None:
         if can_train and not stopping:
             t0 = time.time()
             progress = (now - t_start) / max(1.0, deadline - t_start)
-            m = trainer.step(buf.sample(batch, rng), progress, int(rng.integers(16)))
+            m = trainer.step(buf.sample(batch, rng, a.prio), progress, int(rng.integers(16)))
             train_time += time.time() - t0
             if trainer.steps % 50 == 0:
                 metrics_f.write(json.dumps({"t": now, "step": trainer.steps, "records": records_in,

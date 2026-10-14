@@ -4,8 +4,9 @@
 
 For every case with a stored routing: rebuild it, check it with the independent m3d
 checker, and write <out>/submissions/<tier>/<case>.sol.json. Also writes runtime.json per
-tier (worker seconds spent on the case + a share of learner time proportional to the
-case's training records) and summary.md (aggregate vs the suite baseline per tier).
+tier and summary.md (aggregate vs the suite baseline per tier). A case's runtime is the worker
+seconds spent on it plus a share of the overhead (learner time and all worker time spent on
+generated training cases) proportional to the case's training records.
 """
 from __future__ import annotations
 
@@ -24,7 +25,10 @@ def export(work: str, out: str) -> str:
     stats_path = os.path.join(work, "case_stats.json")
     stats = json.load(open(stats_path)) if os.path.exists(stats_path) else {}
     learner_s = stats.get("_meta", {}).get("learner_seconds", 0.0)
-    total_records = sum(s.get("records", 0) for k, s in stats.items() if not k.startswith("_")) or 1
+    gen_s = sum(s.get("seconds", 0.0) for k, s in stats.items() if k.startswith("gen/"))
+    overhead = learner_s + gen_s
+    total_records = sum(s.get("records", 0) for k, s in stats.items()
+                        if not k.startswith("_") and not k.startswith("gen/")) or 1
     rows = defaultdict(list)
     runtimes = defaultdict(dict)
     for tier, name, path, base in all_cases():
@@ -42,7 +46,7 @@ def export(work: str, out: str) -> str:
         os.makedirs(d, exist_ok=True)
         P.to_submission().save(os.path.join(d, f"{name}.sol.json"))
         s = stats.get(key, {})
-        secs = s.get("seconds", 0.0) + learner_s * s.get("records", 0) / total_records
+        secs = s.get("seconds", 0.0) + overhead * s.get("records", 0) / total_records
         runtimes[tier][name] = round(secs, 2)
         rows[tier].append((name, base, res.total_delay, P.lower_bound, s.get("initial_delay")))
     lines = ["# azroute export", "", "| tier | cases | aggregate vs baseline | total delay | baseline total | delay / lower bound |",

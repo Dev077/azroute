@@ -4,9 +4,15 @@ A worker asks the dispatcher (run.py) for a case, loads its current routing (or 
 the initial routing on first visit), runs fast greedy rerouting until it stalls, then a
 number of search-guided reroutes proportional to the case's remaining excess. It works on
 several cases at once so their network calls can be batched on the GPU. Until the learner
-publishes a trained network, the search uses the network-free completion evaluator.
+publishes a trained network, the search uses the network-free completion evaluator; after
+that, each visit uses the network except a `control_share` of visits, which stay
+network-free so the two can be compared over the same hours.
 
-Per case it keeps, under <work>/state/:  <key>.npz (current routing + version) and
+Generated (training-only) cases, keys "gen/<name>", start from their reference solution
+instead of an initial routing, skip the greedy phase (its reroutes leave no training
+records) and keep their state under <work>/gen_state/, which is not synced to Drive.
+
+Per challenge case it keeps, under <work>/state/:  <key>.npz (current routing + version) and
 <key>.replay.jsonl (every accepted reroute, for exact replay from the initial routing).
 Training records go to <work>/records/ as .npz shards.
 """
@@ -27,14 +33,18 @@ import numpy as np
 from .features import decision_index, encode
 from .lns import Improver, greedy_until_stall
 from .problem import Problem
-from .search import Search, completion_evaluator, score_total
+from .search import Leaf, Search, completion_evaluator, score_total
 from .tiers import all_cases
 
 ALL = {f"{t}/{n}": (t, n, p, b) for (t, n, p, b) in all_cases()}
 
 
+def is_gen(key: str) -> bool:
+    return key.startswith("gen/")
+
+
 def key_file(work: str, key: str, suffix: str) -> str:
-    return os.path.join(work, "state", key.replace("/", "__") + suffix)
+    return os.path.join(work, "gen_state" if is_gen(key) else "state", key.replace("/", "__") + suffix)
 
 
 def save_routing(work: str, key: str, P: Problem, version: int) -> None:
@@ -87,10 +97,12 @@ class NetEvaluator:
         m.eval()
         self.model, self.mtime, self.ready = m, mt, bool(ck.get("net_ready", False))
 
-    def __call__(self, states) -> List:
+    def __call__(self, reqs) -> List:
+        """reqs: live states (encoded now) or Leafs (encoded earlier)."""
         import torch
         from .model import collate
-        feats = [encode(st.problem, st) for st in states]
+        feats = [r.feats if isinstance(r, Leaf) else encode(r.problem, r) for r in reqs]
+        states = [r.st if isinstance(r, Leaf) else r for r in reqs]
         b = collate(feats, self.device)
         with torch.no_grad(), torch.autocast(self.device.type, dtype=torch.bfloat16,
                                              enabled=self.device.type == "cuda"):
@@ -125,11 +137,12 @@ class RemoteEvaluator:
         if not self.ready:
             self.ready = os.path.exists(self.flag)
 
-    def __call__(self, states) -> Optional[List]:
-        """Results, or None if the inference process does not answer (the caller then falls back
-        to the network-free evaluator and this worker stops using the network)."""
+    def __call__(self, leaves: List[Leaf]) -> Optional[List]:
+        """Results, or None if the inference process does not answer (this worker then stops
+        using the network)."""
+        states = [lf.st for lf in leaves]
         self.rid += 1
-        self.q.put(("eval", self.wid, self.rid, [encode(st.problem, st) for st in states]))
+        self.q.put(("eval", self.wid, self.rid, [lf.feats for lf in leaves]))
         while True:
             try:
                 rid, logits, y, fb, price = self.resp_q.get(timeout=120)
@@ -143,11 +156,17 @@ class RemoteEvaluator:
         return to_results(states, logits, y, fb, price)
 
 
+def neutral_results(leaves: List[Leaf]) -> List:
+    """Stand-in when the network cannot answer: uniform prior, ideal completion of the pending nets."""
+    return [(np.zeros(len(lf.st.legal_decisions())), score_total(lf.st, lf.st.rerouted_delay + lf.st.ideal_pending), None) for lf in leaves]
+
+
 class Slot:
     """One case being worked on: greedy phase done, now driving search-guided reroutes."""
 
-    def __init__(self, key, P, imp, search, n_search, cfg, t0, start_delay, version):
+    def __init__(self, key, P, imp, search, n_search, cfg, t0, start_delay, version, use_net=False):
         self.key, self.P, self.imp, self.search = key, P, imp, search
+        self.use_net = use_net
         self.n_left, self.cfg = n_search, cfg
         self.t0, self.start_delay, self.version = t0, start_delay, version
         self.records: List[Dict] = []
@@ -156,7 +175,7 @@ class Slot:
         self.pending_req = None
 
     def next_request(self, reply=None):
-        """Advance until the search needs an evaluation (returns the state) or the visit ends (None)."""
+        """Advance until the search needs evaluations (returns the request list) or the visit ends (None)."""
         while True:
             if self.gen is None:
                 if self.n_left <= 0 or self.cfg.get("stop_flag") and os.path.exists(self.cfg["stop_flag"]):
@@ -207,15 +226,21 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         req_q.put(("get", wid))
         while True:
             try:
-                key = resp_q.get(timeout=10)
+                msg = resp_q.get(timeout=10)
                 break
             except queue.Empty:
                 if orphaned():
                     raise SystemExit(0)
-        if key is None:
+        if msg is None:
             return None
+        key, hint = msg
         t0 = time.time()
-        tier, name, path, base = ALL[key]
+        gen = is_gen(key)
+        if gen:
+            path, ref = cfg["gen_cases"][key]
+            base = None
+        else:
+            tier, name, path, base = ALL[key]
         P = cache.get(key)
         ver = stored_version(work, key)
         if P is None or getattr(P, "_version", None) != ver:
@@ -223,13 +248,17 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
                 P = Problem.load(path)
             stored = load_routing(work, key)
             if stored is None:
-                big = P.W * P.H * P.L > 300_000
-                ok = P.initial_route(schedules=[P.SCHEDULES[0]] if big else None,
-                                     orders=None)
-                if not ok:
-                    req_q.put(("log", wid, f"{key}: initial routing failed"))
-                    req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
-                    return acquire()
+                if gen:
+                    P.restore_submission(ref)
+                    base = P.router.total_delay()
+                else:
+                    big = P.W * P.H * P.L > 300_000
+                    ok = P.initial_route(schedules=[P.SCHEDULES[0]] if big else None,
+                                         orders=None)
+                    if not ok:
+                        req_q.put(("log", wid, f"{key}: initial routing failed"))
+                        req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
+                        return acquire()
                 ver = 0
                 save_routing(work, key, P, ver)
                 init = {"initial_delay": P.router.total_delay(), "lower_bound": P.lower_bound, "baseline": base}
@@ -244,12 +273,19 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             cache.popitem(last=False)
         imp = Improver(P, random.Random(rng.randrange(2 ** 32)))
         start = P.router.total_delay()
-        greedy_until_stall(imp, stall_tries=cfg["stall_tries"], max_seconds=cfg["greedy_seconds"])
+        if not gen:
+            greedy_until_stall(imp, stall_tries=cfg["stall_tries"], max_seconds=cfg["greedy_seconds"])
         frac = (P.router.total_delay() - P.lower_bound) / max(1, P.lower_bound)
         n_search = 0 if frac < cfg["min_excess"] else int(min(cfg["max_search"], max(4, round(P.N * frac))))
+        net.refresh()
+        use_net = net.ready and rng.random() >= cfg["control_share"]
         search = Search(imp, n_full=cfg["n_full"], n_fast=cfg["n_fast"], p_full=cfg["p_full"],
-                        gumbel_scale=cfg["gumbel_scale"], rng=random.Random(rng.randrange(2 ** 32)))
-        s = Slot(key, P, imp, search, n_search, dict(cfg, stop_flag=stop_flag), t0, start, ver)
+                        gumbel_scale=cfg["gumbel_scale"], max_considered=cfg.get("considered", 16),
+                        max_considered_fast=cfg.get("considered_fast"),
+                        rng=random.Random(rng.randrange(2 ** 32)),
+                        defer=use_net, explore_fast=cfg["explore_fast"])
+        scfg = dict(cfg, stop_flag=stop_flag, k_max=hint.get("k_max", cfg["k_max"]))
+        s = Slot(key, P, imp, search, n_search, scfg, t0, start, ver, use_net)
         s.pending_req = s.next_request()
         return s
 
@@ -261,9 +297,10 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             ver = s.version + 1
             save_routing(work, key, P, ver)
             P._version = ver
-            with open(key_file(work, key, ".replay.jsonl"), "a") as f:
-                for e in s.imp.log:
-                    f.write(json.dumps(e) + "\n")
+            if not is_gen(key):          # generated cases are never exported: no replay log
+                with open(key_file(work, key, ".replay.jsonl"), "a") as f:
+                    for e in s.imp.log:
+                        f.write(json.dumps(e) + "\n")
             s.imp.log.clear()
         if s.records:
             out = {k: np.stack([r[k] for r in s.records]) for k in s.records[0]}
@@ -272,10 +309,32 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             os.replace(path + ".tmp.npz", path)
             shard += 1
         stats = dict(s.stats, seconds=time.time() - s.t0, start=s.start_delay, delay=delay,
-                     records=len(s.records), lower_bound=P.lower_bound, network=net.ready)
+                     records=len(s.records), lower_bound=P.lower_bound, network=s.use_net,
+                     k_max=s.cfg["k_max"])
         req_q.put(("done", key, stats))
 
     completion = {}
+
+    def evaluate(slots: List[Slot]) -> List[List]:
+        """Answer every slot's pending requests: one inference call for all network slots."""
+        out: List[Optional[List]] = [None] * len(slots)
+        net_i = [i for i, s in enumerate(slots) if s.use_net]
+        if net_i:
+            leaves = [lf for i in net_i for lf in slots[i].pending_req]
+            res = net(leaves) if net.ready else None
+            if res is None:
+                res = neutral_results(leaves)
+            j = 0
+            for i in net_i:
+                k = len(slots[i].pending_req)
+                out[i] = res[j:j + k]
+                j += k
+        for i, s in enumerate(slots):
+            if not s.use_net:
+                ev = completion.setdefault(id(s.imp), completion_evaluator(s.imp))
+                out[i] = [ev(st) for st in s.pending_req]
+        return out
+
     while not os.path.exists(stop_flag):
         if orphaned():
             return
@@ -291,15 +350,8 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         if not slots:
             time.sleep(1.0)
             continue
-        states = [s.pending_req for s in slots]
-        results = net(states) if net.ready else None
-        if results is None:
-            results = []
-            for s, st in zip(slots, states):
-                ev = completion.setdefault(id(s.imp), completion_evaluator(s.imp))
-                results.append(ev(st))
         keep = []
-        for s, r in zip(slots, results):
+        for s, r in zip(slots, evaluate(slots)):
             s.pending_req = s.next_request(r)
             if s.pending_req is None:
                 completion.pop(id(s.imp), None)
@@ -307,11 +359,16 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             else:
                 keep.append(s)
         slots = keep
-    # stop requested: finish what is in flight without further search
+    # stop requested: finish the reroutes in flight, start no new ones
     for s in slots:
-        while s.pending_req is not None:
-            ev = completion.setdefault(id(s.imp), completion_evaluator(s.imp))
-            s.n_left = 0
-            s.pending_req = s.next_request(ev(s.pending_req))
-        release(s)
+        s.n_left = 0
+    while slots:
+        keep = []
+        for s, r in zip(slots, evaluate(slots)):
+            s.pending_req = s.next_request(r)
+            if s.pending_req is None:
+                release(s)
+            else:
+                keep.append(s)
+        slots = keep
     req_q.put(("exit", wid))

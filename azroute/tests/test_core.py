@@ -82,6 +82,43 @@ class CoreTests(unittest.TestCase):
             twice = augment(augment(b, sym), sym)
             for k in ("maps", "rois", "nodes", "ld"):
                 self.assertTrue(torch.allclose(twice[k].float(), b[k].float(), atol=1e-6), (sym, k))
+        self.assertGreater(buf.sample(64, np.random.default_rng(1), prio=0.5)["y"].shape[0], 0)
+
+    def test_deferred_search_matches_sequential(self):
+        """Batching a halving round into one request must not change any decision or record."""
+        import torch
+        from azroute.model import RouteNet
+        from azroute.worker import NetEvaluator
+        torch.manual_seed(0)
+        net = NetEvaluator("", torch.device("cpu"))
+        net.model = RouteNet.preset("tiny").eval()
+        runs = []
+        for defer in (False, True):
+            P = _case("hard", 0)
+            P.initial_route()
+            imp = Improver(P, random.Random(3), max_nets=5)
+            search = Search(imp, n_full=16, n_fast=4, p_full=0.5, defer=defer, rng=random.Random(7))
+            recs = []
+            for _ in range(3):
+                *_, r = drive(search.reroute(imp.neighbourhood(imp.pick_seed())), lambda x: net([x])[0])
+                recs += r
+            runs.append((P.snapshot(), recs))
+        (snap_a, recs_a), (snap_b, recs_b) = runs
+        self.assertEqual(snap_a, snap_b)
+        self.assertEqual(len(recs_a), len(recs_b))
+        for ra, rb in zip(recs_a, recs_b):
+            np.testing.assert_allclose(ra["pi"].astype(np.float32), rb["pi"].astype(np.float32), atol=1e-3)
+            self.assertAlmostEqual(float(ra["spread"]), float(rb["spread"]), places=4)
+
+    def test_reference_solution_restores_exactly(self):
+        import os
+        from azroute.tiers import ROOT, TIER_DIRS
+        name, path, base = cases("hard")[0]
+        P = Problem.load(path)
+        P.restore_submission(os.path.join(ROOT, TIER_DIRS["hard"], "reference", f"{name}.sol.json"))
+        res = P.verify()
+        self.assertTrue(res.legal, res.reasons)
+        self.assertEqual(P.router.total_delay(), base)
 
 
 if __name__ == "__main__":

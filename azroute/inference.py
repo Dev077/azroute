@@ -22,7 +22,7 @@ from typing import Dict, List
 
 import numpy as np
 
-MAX_BATCH = 256
+MAX_BATCH = 768          # workers send a whole halving round per request
 GATHER_SECONDS = 0.002      # after the first request, wait this long for more to join the batch
 RELOAD_SECONDS = 2.0
 

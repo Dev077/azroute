@@ -53,6 +53,8 @@ Open `colab_train.ipynb` from this repository in Colab, choose a **G4** GPU runt
 the `m3d` toolkit and the benchmarks, builds the core, runs the tests, starts the run in the
 background, and has cells to monitor, stop early, and export. State is checkpointed to Drive
 every 30 minutes; after a disconnect, rerun cells 1-5 and it resumes with its original deadline.
+To add generated training-only cases (folders of `tNNNNN.json` + `tNNNNN.ref.sol.json`, e.g. made
+with `m3d/generator.py`), set `GEN_DIRS` in cell 1; they get half the visits and are never exported.
 
 Outputs (in `DRIVE_DIR/export/`): `submissions/<tier>/<case>.sol.json`, `submissions/<tier>/runtime.json`,
 and `summary.md`. Before submitting to the leaderboard, add `meta.json` per tier as described in

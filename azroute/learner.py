@@ -33,6 +33,7 @@ FIELDS = {
     "blocked": ((), np.uint8),
     "fut_valid": ((), np.uint8),
     "excess": ((MAX_NETS,), np.float16),
+    "spread": ((), np.float32),                 # max - min Q over the searched decisions
 }
 
 
@@ -50,14 +51,23 @@ class ReplayBuffer:
         m = len(batch["y"])
         for i in range(m):
             for k in FIELDS:
-                self.data[k][self.pos] = batch[k][i]
+                if k in batch:          # shards written before a field existed leave it at 0
+                    self.data[k][self.pos] = batch[k][i]
+                else:
+                    self.data[k][self.pos] = 0
             self.pos = (self.pos + 1) % self.cap
             self.n = min(self.n + 1, self.cap)
         return m
 
-    def sample(self, b: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:
-        idx = rng.integers(0, self.n, size=b)
-        return {k: v[idx] for k, v in self.data.items()}
+    def sample(self, b: int, rng: np.random.Generator, prio: float = 0.0) -> Dict[str, np.ndarray]:
+        """Uniform, except a `prio` share of the batch drawn in proportion to the record's spread
+        (records where the searched decisions led to different outcomes)."""
+        n_p = int(round(b * prio))
+        idx = rng.integers(0, self.n, size=b - n_p)
+        if n_p:
+            w = self.data["spread"][: self.n].astype(np.float64) + 1e-3
+            idx = np.concatenate([idx, rng.choice(self.n, size=n_p, p=w / w.sum())])
+        return {k: v[idx] for k, v in self.data.items() if k != "spread"}
 
 
 def to_device(batch: Dict[str, np.ndarray], device) -> Dict[str, torch.Tensor]:
@@ -166,7 +176,7 @@ class Trainer:
         gn = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         self.opt.step()
         self.steps += 1
-        loss = loss.detach()
+        loss, ce, ent, loss_v, loss_b, loss_f, loss_e = (t.detach() for t in (loss, ce, ent, loss_v, loss_b, loss_f, loss_e))
         return {"loss": float(loss), "policy_kl": float((ce - ent).mean()), "policy_ent": float(ent.mean()),
                 "value_mse": float(loss_v), "blocked_bce": float(loss_b), "future_bce": float(loss_f),
                 "excess_mse": float(loss_e), "grad_norm": float(gn), "lr": self.opt.param_groups[0]["lr"],

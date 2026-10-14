@@ -106,10 +106,12 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 | learning rate | 3e-4; linear warm-up over 1000 steps; x 0.3 after 70 % of the run, x 0.1 after 90 % | `--lr` |
 | batch | 512 on GPUs with >= 80 GB (G4), 256 with >= 40 GB, else 128 | `--batch` |
 | precision | bfloat16 autocast on GPU | |
-| replay buffer | min(400k, max(20k, 20 % of free RAM / 30 KB)) records, uniform sampling | `--buffer` |
-| replay ratio cap | at most 8 samples trained per record collected | `--replay-ratio` |
+| replay buffer | min(1M, max(20k, 20 % of free RAM / 30 KB)) records (~30 GB at 1M) | `--buffer` |
+| sampling | half of each batch uniform, half in proportion to the record's spread (max - min Q over the searched decisions, + 1e-3) | `--prio` |
+| replay ratio cap | at most 16 samples trained per record collected | `--replay-ratio` |
 | start training | after 2000 records | `--min-records` |
 | switch workers to the network | after 1000 training steps (before that: network-free search) | `--warmup-steps` |
+| network-free control visits | 10 % of visits after the switch, for a same-hours comparison | `--control-share` |
 | publish weights to workers | every 250 steps | |
 | augmentation | one of 16 symmetries per batch: flip x, flip y, swap x/y, flip layers + swap dies (pair conflicts are invariant) | |
 
@@ -117,11 +119,12 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 
 | setting | value | flag |
 |---|---|---|
-| simulations, full-depth decision | 64 (recorded as training data) | `--n-full` |
-| simulations, fast decision | 8 (not recorded) | `--n-fast` |
+| simulations, full-depth decision | 128 (recorded as training data) | `--n-full` |
+| simulations, fast decision | 8 budget (not recorded); every remaining candidate gets at least one per round, so ~30 in practice | `--n-fast` |
 | share of full-depth decisions | 0.25 | `--p-full` |
-| actions considered at the root | 16 (Gumbel top-k, then sequential halving) | |
-| Gumbel noise scale | 1.0 on recorded decisions, 0 otherwise; the executed decision has no noise | |
+| actions considered at the root | 32 on full decisions, 16 on fast ones (Gumbel top-k, then sequential halving) | `--considered`, `--considered-fast` |
+| Gumbel noise scale | 1.0 (`--gumbel-scale`) on every decision; it picks the candidates and, through the halving, the executed decision (a worse reroute is rejected, so exploring is cheap) | `--no-explore-fast` turns it off on fast decisions |
+| network requests | one per halving round: every candidate's simulation is encoded, rolled back, and evaluated together (identical decisions, ~5x fewer round trips) | |
 | sigma constants | c_visit = 50, c_scale = 0.1 | |
 | network-free evaluator (warm-up) | completes pending nets (KEEP, else DELAY); unroutable net = 2 x its old delay | |
 
@@ -129,12 +132,13 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 
 | setting | value |
 |---|---|
-| neighbourhood size | random 3-8 nets per search reroute (cap 16) |
+| neighbourhood size | random 3-8 nets per search reroute; a case whose last visits brought no gain gets up to 8 + 2 x (visits without gain) nets, max 16 (`--k-max`, `--k-max-stalled`) |
 | neighbourhood construction | seed net + nets blocking its ideal tree within its box + 3, one more level |
 | seed choice | random, weight = excess / (1 + recent failures) |
 | reroute region | union of the nets' pin boxes + 6 |
 | accept | new neighbourhood delay <= old |
-| greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s |
+| greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s; skipped on generated cases |
+| generated training cases | `--gen-dirs`; start from their reference solution, get `--gen-share` (0.5) of visits, never exported; their worker time is charged to the scored cases' runtime |
 | search reroutes per visit | clamp(round(#nets x excess / lower bound), 4, 64); none if excess < 0.3 % |
 
 ### Routing modes

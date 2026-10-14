@@ -117,6 +117,15 @@ class Problem:
             r.set_route(i, edges)
         r.commit()
 
+    def restore_submission(self, path: str) -> None:
+        """Install the routes of a .sol.json (e.g. a generated case's reference solution)."""
+        sub = Submission.load(path)
+        index = {nid: i for i, nid in enumerate(self.net_ids)}
+        snap = [[] for _ in range(self.N)]
+        for r in sub.routes:
+            snap[index[r.net]] = [(self.vid(a), self.vid(b)) for a, b in r.edges]
+        self.restore(snap)
+
     # -- export -----------------------------------------------------------------
     def to_submission(self) -> Submission:
         routes = []

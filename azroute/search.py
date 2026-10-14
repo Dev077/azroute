@@ -13,9 +13,14 @@ neighbourhood's room for improvement the finished reroute is expected to recover
 clipped to [-1, 1]; a blocked reroute scores -1. The estimated total is exact for the
 nets already rerouted plus the evaluator's estimate for the pending ones.
 
-The search is a generator: whenever it needs a state evaluated it yields the state and
-expects (logits over st.legal_decisions(), q, price canvas or None) back. This lets one
-worker interleave several cases and batch their network calls.
+The search is a generator: whenever it needs evaluations it yields a list of requests and
+expects one (logits over st.legal_decisions(), q, price canvas or None) per request back.
+With `defer=False` a request is the live state (its routes are installed while the evaluator
+runs; the network-free evaluator needs that) and the list has one entry. With `defer=True`
+(network evaluation) a request is a Leaf whose features were encoded before its routes were
+rolled back, so every simulation of one sequential-halving round (one per candidate) goes out
+in a single list. The candidates' subtrees are disjoint, so this changes no decision; it
+turns ~n_sims round trips per decision into one per round.
 """
 from __future__ import annotations
 
@@ -33,6 +38,14 @@ C_SCALE = 0.1
 BLOCKED_NET_PENALTY = 2.0   # completion evaluator: an unroutable pending net counts as 2x its old delay
 
 EvalResult = Tuple[np.ndarray, float, Optional[np.ndarray]]
+
+
+class Leaf:
+    """A state to evaluate later: `feats` were encoded while its routes were installed."""
+    __slots__ = ("st", "feats")
+
+    def __init__(self, st: RerouteState, feats: Dict[str, np.ndarray]):
+        self.st, self.feats = st, feats
 
 
 def slack(st: RerouteState) -> float:
@@ -70,11 +83,11 @@ def completion_evaluator(imp: Improver) -> Callable[[RerouteState], EvalResult]:
 
 
 def drive(gen: Generator, evaluate: Callable[[RerouteState], EvalResult]):
-    """Run a search generator to completion with a synchronous evaluator."""
+    """Run a search generator to completion with a synchronous per-request evaluator."""
     try:
         req = next(gen)
         while True:
-            req = gen.send(evaluate(req))
+            req = gen.send([evaluate(x) for x in req])
     except StopIteration as stop:
         return stop.value
 
@@ -145,72 +158,107 @@ class Search:
 
     def __init__(self, imp: Improver, n_full: int = 64, n_fast: int = 8, p_full: float = 0.25,
                  max_considered: int = 16, gumbel_scale: float = 1.0, record: bool = True,
-                 rng: Optional[random.Random] = None):
+                 max_considered_fast: Optional[int] = None,
+                 rng: Optional[random.Random] = None, defer: bool = False, explore_fast: bool = True):
         self.imp = imp
+        self.defer = defer
+        self.explore_fast = explore_fast
         self.n_full, self.n_fast, self.p_full = n_full, n_fast, p_full
         self.m = max_considered
+        self.m_fast = max_considered_fast or max_considered
         self.gumbel_scale = gumbel_scale
         self.record = record
         self.rng = rng or random.Random(imp.rng.randrange(2 ** 32))
         self.np_rng = np.random.default_rng(self.rng.randrange(2 ** 32))
 
     # -- tree mechanics -----------------------------------------------------------
+    @staticmethod
+    def _set(node: Node, res: EvalResult) -> None:
+        logits, v, price = res
+        node.logits = np.asarray(logits, dtype=np.float64)
+        node.value = float(v)
+        node.price = price
+
+    def _request(self, st: RerouteState):
+        return Leaf(st, encode(self.imp.P, st)) if self.defer else st
+
     def _expand(self, node: Node, st: RerouteState):
+        """Evaluate a node whose state is installed in the router right now."""
         if st.blocked or not st.pending:
             node.terminal = True
             node.value = exact_score(st)
             return node.value
         node.actions = st.legal_decisions()
-        logits, v, price = yield st
-        node.logits = np.asarray(logits, dtype=np.float64)
-        node.value = float(v)
-        node.price = price
+        (res,) = yield [self._request(st)]
+        self._set(node, res)
         return node.value
 
     def _apply(self, node: Node, st: RerouteState, a: Decision) -> bool:
         return self.imp.apply(st, a, node.price if a[1] == "LEARNED_PRICE" else None)
 
-    def _simulate(self, root: Node, st: RerouteState, first: Decision):
+    def _simulate(self, root: Node, st: RerouteState, firsts: List[Decision]):
+        """One simulation per first decision. Deferred leaves of all of them are evaluated in one
+        request; the paths are disjoint below the root, so the order of backups does not matter."""
         r = self.imp.P.router
-        cp = r.checkpoint()
-        s = st.clone()
-        node, a, path = root, first, []
-        while True:
-            child = node.children.get(a)
-            if child is None:
-                child = node.children[a] = Node()
-            self._apply(node, s, a)
-            path.append(child)
-            if not child.expanded:
-                value = yield from self._expand(child, s)
-                break
-            if child.terminal:
-                value = child.value
-                break
-            node = child
-            pi = improved_policy(node)
-            ns = np.array([node.children[x].N if x in node.children else 0 for x in node.actions])
-            a = node.actions[int(np.argmax(pi - ns / (1 + ns.sum())))]
-        r.rollback(cp)
-        root.N += 1
-        for n in path:
-            n.N += 1
-            n.W += value
+        pending, done = [], []
+        for first in firsts:
+            cp = r.checkpoint()
+            s = st.clone()
+            node, a, path = root, first, []
+            while True:
+                child = node.children.get(a)
+                if child is None:
+                    child = node.children[a] = Node()
+                self._apply(node, s, a)
+                path.append(child)
+                if child.terminal:
+                    done.append((path, child.value))
+                    break
+                if not child.expanded:
+                    if s.blocked or not s.pending:
+                        child.terminal = True
+                        child.value = exact_score(s)
+                        done.append((path, child.value))
+                    elif self.defer:
+                        child.actions = s.legal_decisions()
+                        pending.append((child, path, Leaf(s, encode(self.imp.P, s))))
+                    else:
+                        value = yield from self._expand(child, s)
+                        done.append((path, value))
+                    break
+                node = child
+                pi = improved_policy(node)
+                ns = np.array([node.children[x].N if x in node.children else 0 for x in node.actions])
+                a = node.actions[int(np.argmax(pi - ns / (1 + ns.sum())))]
+            r.rollback(cp)
+        if pending:
+            results = yield [leaf for _, _, leaf in pending]
+            for (child, path, _), res in zip(pending, results):
+                self._set(child, res)
+                done.append((path, child.value))
+        for path, value in done:
+            root.N += 1
+            for n in path:
+                n.N += 1
+                n.W += value
 
-    def _choose(self, root: Node, st: RerouteState, n_sims: int, gscale: float):
+    def _choose(self, root: Node, st: RerouteState, n_sims: int, gscale: float, m: int):
         """Gumbel top-m sampling plus sequential halving; the final pick drops the Gumbel noise
         (the reroute is only kept if it is no worse, so the executed decision should exploit)."""
         k = len(root.actions)
         if k == 1:
             return root.actions[0]
         g = gscale * self.np_rng.gumbel(size=k)
-        cand = list(np.argsort(-(g + root.logits))[: min(self.m, k)])
+        cand = list(np.argsort(-(g + root.logits))[: min(m, k)])
         phases = max(1, math.ceil(math.log2(len(cand))))
         for _ in range(phases):
             per = max(1, n_sims // (phases * len(cand)))
-            for i in cand:
-                for _ in range(per):
-                    yield from self._simulate(root, st, root.actions[i])
+            for _ in range(per):
+                if self.defer:
+                    yield from self._simulate(root, st, [root.actions[i] for i in cand])
+                else:
+                    for i in cand:
+                        yield from self._simulate(root, st, [root.actions[i]])
             if len(cand) == 1:
                 break
             max_n = max(c.N for c in root.children.values())
@@ -232,15 +280,20 @@ class Search:
         pending_records = []
         while st.pending and not st.blocked:
             full = self.rng.random() < self.p_full
-            # exploration noise only where the decision becomes a training record
+            # Gumbel noise picks which decisions are considered and, through the halving, the one
+            # executed; a worse reroute is rejected, so exploring on fast searches too is cheap
+            explore = (full and self.record) or self.explore_fast
             a = yield from self._choose(root, st, self.n_full if full else self.n_fast,
-                                        self.gumbel_scale if full and self.record else 0.0)
+                                        self.gumbel_scale if explore else 0.0, self.m if full else self.m_fast)
             if full and self.record and root.logits is not None:
                 feats = encode(P, st)
                 pi = np.zeros(MAX_NETS * N_MODES, dtype=np.float32)
                 pi[decision_index(st)] = improved_policy(root)
+                # how much the searched decisions' outcomes differed: ~0 means nothing to learn
+                qs = [c.q() for c in root.children.values() if c.N > 0]
+                spread = max(qs) - min(qs) if len(qs) > 1 else 0.0
                 pending_records.append((feats, pi.reshape(MAX_NETS, N_MODES), st.rerouted_delay,
-                                        list(st.pending)))
+                                        list(st.pending), spread))
             self._apply(root, st, a)
             nxt = root.children.get(a)
             if nxt is None or not nxt.expanded:
@@ -260,9 +313,10 @@ class Search:
         if not st.blocked:
             for k, n in enumerate(st.hood.nets[:MAX_NETS]):
                 net_ex[k] = math.log(max(1, P.router.net_delay(n)) / max(1, P.ideal[n]))
-        for feats, pi, rerouted_t, pending_t in pending_records:
+        for feats, pi, rerouted_t, pending_t, spread in pending_records:
             rec = dict(feats)
             rec["pi"] = pi.astype(np.float16)
+            rec["spread"] = np.float32(spread)
             if st.blocked:
                 rec["y"] = np.float32(np.nan)
                 rec["blocked"] = np.uint8(1)
