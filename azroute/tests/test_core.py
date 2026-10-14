@@ -110,6 +110,30 @@ class CoreTests(unittest.TestCase):
             np.testing.assert_allclose(ra["pi"].astype(np.float32), rb["pi"].astype(np.float32), atol=1e-3)
             self.assertAlmostEqual(float(ra["spread"]), float(rb["spread"]), places=4)
 
+    def test_keeping_worse_reroutes_restores_the_best_exactly(self):
+        """With worse reroutes kept, restore_best() must give back the best routing, and the
+        truncated log must replay to it exactly."""
+        from azroute.lns import RecordToRecord, greedy_policy
+        P = _case("hard", 0)
+        P.initial_route()
+        imp = Improver(P, random.Random(5), max_nets=6, accept=RecordToRecord(0.02, 1e6))
+        worse = 0
+        for _ in range(300):
+            before = imp.total
+            imp.reroute(imp.neighbourhood(imp.pick_seed()), greedy_policy)
+            self.assertEqual(imp.total, P.router.total_delay())
+            worse += imp.total > before
+        self.assertGreater(worse, 0)
+        imp.restore_best()
+        res = P.verify()
+        self.assertTrue(res.legal, res.reasons)
+        self.assertEqual(res.total_delay, imp.best_total)
+        Q = _case("hard", 0)
+        Q.initial_route()
+        replay(Q, imp.log)
+        # a restored route may list its edges in another order; compare edge sets
+        self.assertEqual([sorted(e) for e in Q.snapshot()], [sorted(e) for e in P.snapshot()])
+
     def test_reference_solution_restores_exactly(self):
         import os
         from azroute.tiers import ROOT, TIER_DIRS

@@ -67,16 +67,68 @@ def unpack_price(s: str, L: int) -> np.ndarray:
     return np.frombuffer(base64.b64decode(s), dtype=np.uint8).reshape(L, CROP, CROP)
 
 
+class Acceptance:
+    """Which finished reroutes to keep, judged on the case's total delay before and after.
+    The default keeps a reroute only if the total does not increase."""
+    name = "strict"
+
+    def ok(self, before: int, after: int, best: int) -> bool:
+        return after <= before
+
+    def tick(self, total: int) -> None:
+        """Called after every finished reroute with the (possibly unchanged) total."""
+
+
+class RecordToRecord(Acceptance):
+    """Also keep a worse reroute while the total stays within `tau` of the best total found,
+    with `tau` shrinking linearly to 0 over `seconds` (record-to-record travel)."""
+    name = "rrt"
+
+    def __init__(self, tau: float, seconds: float):
+        self.tau, self.seconds, self.t0 = tau, seconds, time.time()
+
+    def ok(self, before: int, after: int, best: int) -> bool:
+        left = max(0.0, 1.0 - (time.time() - self.t0) / self.seconds)
+        return after <= before or after <= best * (1.0 + self.tau * left)
+
+
+class LateAcceptance(Acceptance):
+    """Also keep a worse reroute if the new total is no worse than the total `length`
+    finished reroutes ago (late acceptance hill climbing)."""
+    name = "lahc"
+
+    def __init__(self, length: int):
+        self.length, self.hist, self.v = length, [], 0
+
+    def ok(self, before: int, after: int, best: int) -> bool:
+        if not self.hist:
+            self.hist = [before] * self.length
+        return after <= before or after <= self.hist[self.v % self.length]
+
+    def tick(self, total: int) -> None:
+        if not self.hist:
+            self.hist = [total] * self.length
+        self.hist[self.v % self.length] = total
+        self.v += 1
+
+
 class Improver:
     def __init__(self, problem: Problem, rng: random.Random, max_nets: int = 6,
-                 seed_margin: int = 3, region_margin: int = 6):
+                 seed_margin: int = 3, region_margin: int = 6, accept: Optional[Acceptance] = None):
         self.P = problem
         self.rng = rng
         self.max_nets = max_nets
         self.seed_margin = seed_margin
         self.region_margin = region_margin
         self.fail_count: Dict[int, int] = {}
-        self.log: List[dict] = []      # accepted improving reroutes, for exact replay
+        self.log: List[dict] = []      # accepted reroutes, for exact replay
+        self.accept = accept or Acceptance()
+        # the best routing seen: while the current routing is the best, best_snap is None; it is
+        # saved only when a worse reroute is kept (never under the default acceptance)
+        self.total = problem.router.total_delay()
+        self.best_total = self.total
+        self.best_snap: Optional[list] = None
+        self.best_log_len = 0
 
     # -- neighbourhood selection ------------------------------------------------
     def excess(self, i: int) -> int:
@@ -174,18 +226,38 @@ class Improver:
         if st.blocked or st.pending:
             r.rollback(cp)
             self.fail_count[hood.seed] = self.fail_count.get(hood.seed, 0) + 1
+            self.accept.tick(self.total)
             return False, -1
         new = st.rerouted_delay
-        if new <= st.old_delay:
+        after = self.total + new - st.old_delay
+        if self.accept.ok(self.total, after, self.best_total):
+            if after > self.best_total and self.best_snap is None:
+                # leaving the best routing: save it (the current routes with the old ones of this neighbourhood)
+                snap = self.P.snapshot()
+                for n in hood.nets:
+                    snap[n] = list(st.old_edges[n])
+                self.best_snap = snap
             r.commit()
             if new < st.old_delay:
                 self.fail_count.pop(hood.seed, None)
             self.log.append({"nets": hood.nets, "region": list(hood.region),
                              "decisions": [[n, m] for n, m in st.done], "prices": st.prices})
+            self.total = after
+            if after <= self.best_total:
+                self.best_total, self.best_snap, self.best_log_len = after, None, len(self.log)
+            self.accept.tick(self.total)
             return True, new
         r.rollback(cp)
         self.fail_count[hood.seed] = self.fail_count.get(hood.seed, 0) + 1
+        self.accept.tick(self.total)
         return False, new
+
+    def restore_best(self) -> None:
+        """Go back to the best routing seen, and drop the logged reroutes made after it."""
+        if self.best_snap is not None:
+            self.P.restore(self.best_snap)
+            self.total, self.best_snap = self.best_total, None
+            del self.log[self.best_log_len:]
 
     def reroute(self, hood: Neighbourhood, policy: "Policy") -> Tuple[bool, int, int]:
         """Rip up and reroute a neighbourhood with a synchronous policy. Returns (accepted, old, new)."""
