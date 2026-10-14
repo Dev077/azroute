@@ -251,19 +251,26 @@ def main(argv=None) -> None:
     from .inference import inference_main
     infer_proc = ctx.Process(target=inference_main, args=(cfg, infer_q, infer_resp_qs, req_q), daemon=True)
     infer_proc.start()
-    procs = [ctx.Process(target=worker_main, args=(i, cfg, req_q, resp_qs[i], infer_q, infer_resp_qs[i]),
-                         daemon=True) for i in range(W)]
-    for p in procs:
+    def spawn(i):
+        p = ctx.Process(target=worker_main, args=(i, cfg, req_q, resp_qs[i], infer_q, infer_resp_qs[i]),
+                        daemon=True)
         p.start()
+        return p
+
+    procs = [spawn(i) for i in range(W)]
 
     order: list = []
     gen_order: list = []
     gen_rng = random.Random(a.seed + 1)
     busy: set = set()
+    held = {i: set() for i in range(W)}     # cases each worker is on, released if it crashes
+    bad: set = set()                        # cases skipped for the rest of the run
+    crashes: dict = {}                      # case -> worker crashes while on it
+    restarts = 0
     exited = 0
     metrics_f = open(os.path.join(work, "metrics.jsonl"), "a")
     visits_f = open(os.path.join(work, "visits.jsonl"), "a")
-    last_sync = last_log = time.time()
+    last_sync = last_log = last_reap = time.time()
     train_time = 0.0
     learner_seconds0 = meta["learner_seconds"]
     stopping = False
@@ -276,13 +283,13 @@ def main(argv=None) -> None:
         if gen_cases and gen_rng.random() < a.gen_share:
             for _ in range(2):
                 for i, k in enumerate(gen_order):
-                    if k not in busy:
+                    if k not in busy and k not in bad:
                         gen_order.pop(i)
                         return k
                 gen_order = gen_order + gen_rng.sample(list(gen_cases), len(gen_cases))
         for _ in range(2):
             for i, k in enumerate(order):
-                if k not in busy:
+                if k not in busy and k not in bad:
                     order.pop(i)
                     return k
             order = order + random.Random(int(rng.integers(1 << 30))).sample(cases, len(cases))
@@ -298,11 +305,16 @@ def main(argv=None) -> None:
                 resp_qs[wid].put(None)
             else:
                 busy.add(k)
+                held[wid].add(k)
                 stall = stats.get(k, {}).get("stall", 0)
                 resp_qs[wid].put((k, {"k_max": min(a.k_max_stalled, a.k_max + 2 * stall) if stall else a.k_max}))
         elif kind == "done":
             k, st = msg[1], msg[2]
             busy.discard(k)
+            for h in held.values():
+                h.discard(k)
+            if st.get("failed") and k.startswith("gen/"):
+                bad.add(k)
             s = stats.setdefault(k, gen_stats(k))
             if "delay" in st and "start" in st:
                 s["stall"] = 0 if st["delay"] < st["start"] else s.get("stall", 0) + 1
@@ -322,10 +334,37 @@ def main(argv=None) -> None:
             if msg[1] == "inference":
                 log(f"inference process crashed (workers fall back to network-free search):\n{msg[2]}")
             else:
-                log(f"worker {msg[1]} crashed:\n{msg[2]}")
-                exited += 1
+                log(f"worker {msg[1]} crashed:\n{msg[2]}")    # reap() restarts it once it has exited
         elif kind == "exit":
             exited += 1
+
+    def reap():
+        """Restart workers that died (crash, or killed e.g. for memory), releasing their cases."""
+        nonlocal restarts, exited
+        for wid, p in enumerate(procs):
+            if p is None or p.is_alive():
+                continue
+            for k in held[wid]:
+                busy.discard(k)
+                crashes[k] = crashes.get(k, 0) + 1
+                if crashes[k] >= 2:
+                    bad.add(k)
+                    log(f"{k}: was being worked on when a worker died twice; skipped for the rest of the run")
+            held[wid] = set()
+            for q in (resp_qs[wid], infer_resp_qs[wid]):    # drop replies meant for the dead worker
+                try:
+                    while True:
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+            if restarts < 3 * W:
+                restarts += 1
+                procs[wid] = spawn(wid)
+                log(f"worker {wid} died (exit code {p.exitcode}); restarted ({restarts} restarts so far)")
+            else:
+                procs[wid] = None
+                exited += 1
+                log(f"worker {wid} died (exit code {p.exitcode}); restart limit reached, not restarted")
 
     def ingest():
         nonlocal records_in
@@ -375,6 +414,9 @@ def main(argv=None) -> None:
         if stopping and (exited >= W or time.time() > deadline + a.export_minutes * 30):
             break
         ingest()
+        if not stopping and now - last_reap > 10:
+            last_reap = now
+            reap()
         can_train = buf.n >= a.min_records and (trainer.steps - steps0) * batch < a.replay_ratio * records_in
         if can_train and not stopping:
             t0 = time.time()
@@ -403,7 +445,8 @@ def main(argv=None) -> None:
             sync(work, a.drive)
             log("synced to drive")
     for p in procs:
-        p.join(timeout=60)
+        if p is not None:
+            p.join(timeout=60)
     infer_q.put(None)
     infer_proc.join(timeout=30)
     save_all()

@@ -244,12 +244,23 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         P = cache.get(key)
         ver = stored_version(work, key)
         if P is None or getattr(P, "_version", None) != ver:
+            if gen:
+                # a generated file that does not load is skipped for the rest of the run
+                try:
+                    if P is None:
+                        P = Problem.load(path)
+                    if load_routing(work, key) is None:
+                        P.restore_submission(ref)
+                except Exception as e:
+                    req_q.put(("log", wid, f"{key}: skipped, could not load ({type(e).__name__}: {e})"))
+                    req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
+                    cache.pop(key, None)
+                    return acquire()
             if P is None:
                 P = Problem.load(path)
             stored = load_routing(work, key)
             if stored is None:
                 if gen:
-                    P.restore_submission(ref)
                     base = P.router.total_delay()
                 else:
                     big = P.W * P.H * P.L > 300_000
