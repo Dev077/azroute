@@ -110,6 +110,13 @@ def main(argv=None) -> None:
     ap.add_argument("--k-max", type=int, default=8, help="max nets per neighbourhood on a case that improves")
     ap.add_argument("--k-max-stalled", type=int, default=16,
                     help="max nets per neighbourhood once a case stops improving (+2 per visit without gain)")
+    ap.add_argument("--polish-workers", type=int, default=-1,
+                    help="workers that only polish scored cases (network-free, record-to-record acceptance, "
+                         "no training records); -1 = half the workers, 0 = none")
+    ap.add_argument("--polish-minutes", type=float, default=30.0, help="length of one polish visit")
+    ap.add_argument("--polish-tau", type=float, default=0.003,
+                    help="polish: a worse reroute is kept while the case total stays within this fraction of "
+                         "the best total of the visit; shrinks linearly to 0 over the visit")
     ap.add_argument("--min-records", type=int, default=2000)
     ap.add_argument("--warmup-steps", type=int, default=1000, help="train steps before workers switch to the network")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -171,6 +178,7 @@ def main(argv=None) -> None:
     gpu_gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30 if device.type == "cuda" else 0.0
     W = auto_workers(a.workers, gpu_gb) if not a.smoke else 2
     C = a.concurrency or max(1, min(2, (len(cases) + len(gen_cases)) // W))
+    PW = min(W - 1, W // 2 if a.polish_workers < 0 else a.polish_workers) if W > 1 else 0
     if a.batch:
         batch = a.batch
     elif device.type == "cuda":
@@ -192,12 +200,16 @@ def main(argv=None) -> None:
            "min_excess": 0.003, "max_search": 64 if not a.smoke else 3, "n_full": a.n_full,
            "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": a.gumbel_scale, "considered": a.considered,
            "considered_fast": a.considered_fast, "k_min": 3, "k_max": a.k_max,
-           "control_share": a.control_share, "explore_fast": a.explore_fast, "gen_cases": gen_cases}
-    run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C, batch=batch, buffer=cap, device=str(device),
+           "control_share": a.control_share, "explore_fast": a.explore_fast, "gen_cases": gen_cases,
+           # polish visits use the settings measured in accept_bench (network-free search, 3-8 nets)
+           "polish_workers": PW, "polish_seconds": a.polish_minutes * 60, "polish_tau": a.polish_tau,
+           "polish_search": dict(n_full=32, n_fast=8, p_full=0.25, considered=16, k_min=3, k_max=8)}
+    run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C,
+                   polish_workers=PW, batch=batch, buffer=cap, device=str(device),
                    cases=len(cases), gen_cases=len(gen_cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
                    cpus=os.cpu_count())
     json.dump(run_cfg, open(os.path.join(work, "run_config.json"), "w"), indent=1)
-    log(f"device={device} gpu={run_cfg['gpu']} cpus={os.cpu_count()} workers={W} concurrency={C} "
+    log(f"device={device} gpu={run_cfg['gpu']} cpus={os.cpu_count()} workers={W} (polish {PW}) concurrency={C} "
         f"batch={batch} buffer={cap} cases={len(cases)} gen_cases={len(gen_cases)}")
 
     # -- learner -------------------------------------------------------------------
@@ -274,19 +286,23 @@ def main(argv=None) -> None:
     train_time = 0.0
     learner_seconds0 = meta["learner_seconds"]
     stopping = False
+    polish_log: list = []                   # relative gain of each polish visit since the last status line
 
     def gen_stats(k):
         return {"tier": "gen", "case": k[4:], "baseline": None, "seconds": 0.0, "visits": 0, "records": 0}
 
-    def next_case():
-        nonlocal order, gen_order
-        if gen_cases and gen_rng.random() < a.gen_share:
-            for _ in range(2):
-                for i, k in enumerate(gen_order):
-                    if k not in busy and k not in bad:
-                        gen_order.pop(i)
-                        return k
-                gen_order = gen_order + gen_rng.sample(list(gen_cases), len(gen_cases))
+    def next_gen():
+        nonlocal gen_order
+        for _ in range(2):
+            for i, k in enumerate(gen_order):
+                if k not in busy and k not in bad:
+                    gen_order.pop(i)
+                    return k
+            gen_order = gen_order + gen_rng.sample(list(gen_cases), len(gen_cases))
+        return None
+
+    def next_scored():
+        nonlocal order
         for _ in range(2):
             for i, k in enumerate(order):
                 if k not in busy and k not in bad:
@@ -295,19 +311,44 @@ def main(argv=None) -> None:
             order = order + random.Random(int(rng.integers(1 << 30))).sample(cases, len(cases))
         return None
 
+    def next_case():
+        # when polish workers hold most scored cases, training visits fall back to generated ones
+        if gen_cases and gen_rng.random() < a.gen_share:
+            return next_gen() or next_scored()
+        return next_scored() or (next_gen() if gen_cases else None)
+
+    def next_polish():
+        """The free scored case with the most expected gain: never-polished cases first, then by
+        the recent relative gain per polish minute, growing with the time since the last polish."""
+        now = time.time()
+        best_k, best_p = None, -1.0
+        for k in cases:
+            if k in busy or k in bad:
+                continue
+            s = stats[k]
+            if s.get("polish_rate") is None:
+                p = float("inf")
+            else:
+                p = max(s["polish_rate"], 1e-7) * (1 + (now - s.get("polish_t", now)) / 3600)
+            if p > best_p:
+                best_k, best_p = k, p
+        return best_k
+
     def handle(msg):
         nonlocal exited
         kind = msg[0]
         if kind == "get":
             wid = msg[1]
-            k = None if stopping else next_case()
+            polish = wid < PW
+            k = None if stopping else (next_polish() if polish else next_case())
             if k is None:
                 resp_qs[wid].put(None)
             else:
                 busy.add(k)
                 held[wid].add(k)
                 stall = stats.get(k, {}).get("stall", 0)
-                resp_qs[wid].put((k, {"k_max": min(a.k_max_stalled, a.k_max + 2 * stall) if stall else a.k_max}))
+                resp_qs[wid].put((k, {"k_max": min(a.k_max_stalled, a.k_max + 2 * stall) if stall else a.k_max,
+                                      "polish": polish}))
         elif kind == "done":
             k, st = msg[1], msg[2]
             busy.discard(k)
@@ -316,7 +357,14 @@ def main(argv=None) -> None:
             if st.get("failed") and k.startswith("gen/"):
                 bad.add(k)
             s = stats.setdefault(k, gen_stats(k))
-            if "delay" in st and "start" in st:
+            if st.get("polish") and "delay" in st:
+                gain = (st["start"] - st["delay"]) / max(1, st["start"])
+                rate = gain / max(1.0, st.get("seconds", 0.0) / 60)
+                s["polish_rate"] = rate if s.get("polish_rate") is None else 0.5 * s["polish_rate"] + 0.5 * rate
+                s["polish_t"] = time.time()
+                s["polish_visits"] = s.get("polish_visits", 0) + 1
+                polish_log.append(gain)
+            elif "delay" in st and "start" in st:
                 s["stall"] = 0 if st["delay"] < st["start"] else s.get("stall", 0) + 1
             s["seconds"] += st.get("seconds", 0.0)
             s["visits"] += 1
@@ -437,8 +485,11 @@ def main(argv=None) -> None:
             time.sleep(0.05)
         if now - last_log > 300:
             last_log = now
+            pol = (f" polish={len(polish_log)} visits, {sum(g > 0 for g in polish_log)} improved, "
+                   f"mean {100 * sum(polish_log) / len(polish_log):.3f}%" if polish_log else "")
+            polish_log.clear()
             log(f"steps={trainer.steps} records={records_in} buffer={buf.n} busy={len(busy)} "
-                f"train_s={train_time:.0f} | {summary()}")
+                f"train_s={train_time:.0f}{pol} | {summary()}")
         if now - last_sync > a.sync_minutes * 60:
             last_sync = now
             save_all()

@@ -13,6 +13,8 @@ the AlphaZero learning loop adapted to rip-up-and-reroute.
    route), `DELAY`, `SPARE_MID`, `LEARNED_PRICE`, `OUTER_TRUNK`, `FAR_SINK_FIRST` and `COMPACT`.
    A reroute is kept only if the neighbourhood's delay does not increase, so the routing is
    legal at every point.
+   Half the workers instead *polish* the scored cases: long network-free visits that may keep a
+   slightly worse reroute (record-to-record travel) and end on the best routing they found.
 3. **Search.** Gumbel root selection with sequential halving over the routing decisions.
    A partial reroute is scored by the share of the neighbourhood's room for improvement it is
    expected to recover.
@@ -37,7 +39,8 @@ initial routing (`lns.replay`).
 |---|---|
 | `core/router_core.cpp` | C++ core (pybind11): occupancy, A* tree building, rip-up/undo, negotiated congestion |
 | `problem.py`, `modes.py`, `tiers.py`, `paths.py` | a case loaded into the core; routing modes; the tiers |
-| `lns.py` | neighbourhoods, the improvement loop, replay |
+| `lns.py` | neighbourhoods, the improvement loop, acceptance rules, replay |
+| `accept_bench.py` | compares acceptance rules from the same routings (`python -m azroute.accept_bench --help`) |
 | `search.py` | search over routing decisions; training records |
 | `features.py`, `model.py` | network inputs (incl. pair conflict features); the network |
 | `docs/` | architecture diagram, loss and every setting (`ARCHITECTURE.md`); what to expect from a run (`RUN_EXPECTATIONS.md`) |

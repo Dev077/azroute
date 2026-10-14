@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .features import decision_index, encode
-from .lns import Improver, greedy_until_stall
+from .lns import Improver, RecordToRecord, greedy_until_stall
 from .problem import Problem
 from .search import Leaf, Search, completion_evaluator, score_total
 from .tiers import all_cases
@@ -180,6 +180,8 @@ class Slot:
             if self.gen is None:
                 if self.n_left <= 0 or self.cfg.get("stop_flag") and os.path.exists(self.cfg["stop_flag"]):
                     return None
+                if self.cfg.get("until") and time.time() >= self.cfg["until"]:
+                    return None
                 seed = self.imp.pick_seed()
                 if seed is None:
                     return None
@@ -217,6 +219,8 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     shard = 0
     stop_flag = cfg["stop_flag"]
     parent = os.getppid()
+    # a polish worker works on one case at a time (a polish visit is CPU-bound and long)
+    capacity = 1 if wid < cfg.get("polish_workers", 0) else cfg["concurrency"]
 
     def orphaned() -> bool:
         """The run process died (killed or crashed): this worker must not keep writing."""
@@ -282,8 +286,21 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         cache.move_to_end(key)
         while len(cache) > cfg["cache_cases"]:
             cache.popitem(last=False)
-        imp = Improver(P, random.Random(rng.randrange(2 ** 32)))
         start = P.router.total_delay()
+        if hint.get("polish"):
+            # a long network-free visit that may keep worse reroutes; it ends on the best routing seen
+            ps = cfg["polish_search"]
+            imp = Improver(P, random.Random(rng.randrange(2 ** 32)),
+                           accept=RecordToRecord(cfg["polish_tau"], cfg["polish_seconds"]))
+            search = Search(imp, n_full=ps["n_full"], n_fast=ps["n_fast"], p_full=ps["p_full"],
+                            max_considered=ps["considered"], record=False,
+                            rng=random.Random(rng.randrange(2 ** 32)))
+            scfg = dict(cfg, stop_flag=stop_flag, k_min=ps["k_min"], k_max=ps["k_max"], polish=True,
+                        until=time.time() + cfg["polish_seconds"])
+            s = Slot(key, P, imp, search, 1 << 30, scfg, t0, start, ver)
+            s.pending_req = s.next_request()
+            return s
+        imp = Improver(P, random.Random(rng.randrange(2 ** 32)))
         if not gen:
             greedy_until_stall(imp, stall_tries=cfg["stall_tries"], max_seconds=cfg["greedy_seconds"])
         frac = (P.router.total_delay() - P.lower_bound) / max(1, P.lower_bound)
@@ -303,6 +320,7 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     def release(s: Slot) -> None:
         nonlocal shard
         P, key = s.P, s.key
+        s.imp.restore_best()     # only polish visits can end away from their best routing
         delay = P.router.total_delay()
         if s.imp.log:
             ver = s.version + 1
@@ -319,9 +337,11 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             np.savez(path + ".tmp.npz", **out)
             os.replace(path + ".tmp.npz", path)
             shard += 1
+        polish = bool(s.cfg.get("polish"))
         stats = dict(s.stats, seconds=time.time() - s.t0, start=s.start_delay, delay=delay,
-                     records=len(s.records), lower_bound=P.lower_bound, network=s.use_net,
-                     k_max=s.cfg["k_max"])
+                     records=len(s.records), lower_bound=P.lower_bound, k_max=s.cfg["k_max"], polish=polish,
+                     # polish visits carry no "network" flag, so the network-vs-control comparison skips them
+                     **({} if polish else {"network": s.use_net}))
         req_q.put(("done", key, stats))
 
     completion = {}
@@ -350,7 +370,7 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         if orphaned():
             return
         net.refresh()
-        while len(slots) < cfg["concurrency"] and not os.path.exists(stop_flag):
+        while len(slots) < capacity and not os.path.exists(stop_flag):
             s = acquire()
             if s is None:
                 break

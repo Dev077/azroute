@@ -136,7 +136,8 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 | neighbourhood construction | seed net + nets blocking its ideal tree within its box + 3, one more level |
 | seed choice | random, weight = excess / (1 + recent failures) |
 | reroute region | union of the nets' pin boxes + 6 |
-| accept | new neighbourhood delay <= old |
+| accept | new neighbourhood delay <= old (training visits) |
+| polish visits | `--polish-workers` (default half the workers) only polish scored cases: `--polish-minutes` (30) network-free visits (32/8 simulations, 16 candidates, 3-8 nets), no training records. A worse reroute is kept while the case total stays within `--polish-tau` (0.3 %) of the visit's best total, the margin shrinking linearly to 0 over the visit (record-to-record travel); the visit ends on its best routing, saved with its replay log. The dispatcher sends a polish worker to the free scored case with the highest recent gain per polish minute (never-polished first), the priority growing with the time since its last polish. Measured on the hard tier from a long run's routings, 1 h per case: +2.3 % vs +0.9 % with the strict rule (`accept_bench.py`). |
 | greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s; skipped on generated cases |
 | generated training cases | `--gen-dirs`; start from their reference solution, get `--gen-share` (0.5) of visits, never exported; their worker time is charged to the scored cases' runtime |
 | search reroutes per visit | clamp(round(#nets x excess / lower bound), 4, 64); none if excess < 0.3 % |
