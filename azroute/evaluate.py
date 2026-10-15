@@ -214,6 +214,8 @@ def main(argv=None) -> None:
                 procs[wid], held[wid] = None, None
                 exited.add(wid)
         for f in os.listdir(os.path.join(work, "records")):     # training records are not needed here
+            if f.endswith(".tmp.npz"):      # still being written: a worker renames it next
+                continue
             try:
                 os.remove(os.path.join(work, "records", f))
             except OSError:
