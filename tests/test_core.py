@@ -1,15 +1,15 @@
 """Regression tests: legality and exact delay vs the independent m3d checker, undo/rollback,
 exact replay of logged reroutes (including network-chosen price canvases), and the network's
-input/augmentation plumbing.   python -m unittest azroute.tests.test_core"""
+input/augmentation plumbing.   python -m unittest tests.test_core"""
 import random
 import unittest
 
 import numpy as np
 
-from azroute.lns import Improver, greedy_until_stall, replay
-from azroute.problem import Problem
-from azroute.search import Search, completion_evaluator, drive
-from azroute.tiers import cases
+from routing.lns import Improver, greedy_until_stall, replay
+from routing.problem import Problem
+from search.search import Search, completion_evaluator, drive
+from routing.tiers import cases
 
 
 def _case(tier, i):
@@ -40,8 +40,8 @@ class CoreTests(unittest.TestCase):
 
     def test_improvement_stays_legal_and_replays_exactly(self):
         import torch
-        from azroute.model import RouteNet
-        from azroute.worker import NetEvaluator
+        from network.model import RouteNet
+        from pipeline.worker import NetEvaluator
         P = _case("hard", 0)
         P.initial_route()
         imp = Improver(P, random.Random(0), max_nets=5)
@@ -67,7 +67,7 @@ class CoreTests(unittest.TestCase):
 
     def test_augmentation_is_a_group_action(self):
         import torch
-        from azroute.learner import ReplayBuffer, augment, to_device
+        from network.learner import ReplayBuffer, augment, to_device
         P = _case("hard", 0)
         P.initial_route()
         imp = Improver(P, random.Random(1), max_nets=4)
@@ -87,8 +87,8 @@ class CoreTests(unittest.TestCase):
     def test_deferred_search_matches_sequential(self):
         """Batching a halving round into one request must not change any decision or record."""
         import torch
-        from azroute.model import RouteNet
-        from azroute.worker import NetEvaluator
+        from network.model import RouteNet
+        from pipeline.worker import NetEvaluator
         torch.manual_seed(0)
         net = NetEvaluator("", torch.device("cpu"))
         net.model = RouteNet.preset("tiny").eval()
@@ -113,7 +113,7 @@ class CoreTests(unittest.TestCase):
     def test_keeping_worse_reroutes_restores_the_best_exactly(self):
         """With worse reroutes kept, restore_best() must give back the best routing, and the
         truncated log must replay to it exactly."""
-        from azroute.lns import RecordToRecord, greedy_policy
+        from routing.lns import RecordToRecord, greedy_policy
         P = _case("hard", 0)
         P.initial_route()
         imp = Improver(P, random.Random(5), max_nets=6, accept=RecordToRecord(0.02, 1e6))
@@ -133,16 +133,6 @@ class CoreTests(unittest.TestCase):
         replay(Q, imp.log)
         # a restored route may list its edges in another order; compare edge sets
         self.assertEqual([sorted(e) for e in Q.snapshot()], [sorted(e) for e in P.snapshot()])
-
-    def test_reference_solution_restores_exactly(self):
-        import os
-        from azroute.tiers import ROOT, TIER_DIRS
-        name, path, base = cases("hard")[0]
-        P = Problem.load(path)
-        P.restore_submission(os.path.join(ROOT, TIER_DIRS["hard"], "reference", f"{name}.sol.json"))
-        res = P.verify()
-        self.assertTrue(res.legal, res.reasons)
-        self.assertEqual(P.router.total_delay(), base)
 
 
 if __name__ == "__main__":

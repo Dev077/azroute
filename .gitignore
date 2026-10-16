@@ -1,24 +1,21 @@
 __pycache__/
 *.pyc
-*.png
-!docs/*.png
-*.sol.json
-!benchmarks/reference/*.sol.json
-!benchmarks_hard/reference/*.sol.json
-!benchmarks_scale/reference/*.sol.json
-!benchmarks_stress/reference/*.sol.json
-!benchmarks_congested/reference/*.sol.json
-!benchmarks_designs/reference/*.sol.json
-!examples/submissions/*.sol.json
-!submissions/*/*/*.sol.json
 .venv/
 .pytest_cache/
 build/
 dist/
 *.egg-info/
-
-# gat_mcts training artifacts
-gat_mcts_data/
-runs/
-submissions_local/
 .DS_Store
+
+# the built C++ core (python setup.py)
+*.so
+
+# run state and outputs
+runs/
+work/
+submissions_local/
+
+# routings and per-case renders are large; only the README images are kept
+*.sol.json
+*.png
+!docs/*.png

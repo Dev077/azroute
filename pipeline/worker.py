@@ -8,10 +8,6 @@ publishes a trained network, the search uses the network-free completion evaluat
 that, each visit uses the network except a `control_share` of visits, which stay
 network-free so the two can be compared over the same hours.
 
-Generated (training-only) cases, keys "gen/<name>", start from their reference solution
-instead of an initial routing, skip the greedy phase (its reroutes leave no training
-records) and keep their state under <work>/gen_state/, which is not synced to Drive.
-
 Per challenge case it keeps, under <work>/state/:  <key>.npz (current routing + version) and
 <key>.replay.jsonl (every accepted reroute, for exact replay from the initial routing).
 Training records go to <work>/records/ as .npz shards.
@@ -30,21 +26,17 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .features import decision_index, encode
-from .lns import Improver, RecordToRecord, greedy_until_stall
-from .problem import Problem
-from .search import Leaf, Search, completion_evaluator, score_total
-from .tiers import all_cases
+from network.features import decision_index, encode
+from routing.lns import Improver, RecordToRecord, greedy_until_stall
+from routing.problem import Problem
+from search.search import Leaf, Search, completion_evaluator, score_total
+from routing.tiers import all_cases
 
 ALL = {f"{t}/{n}": (t, n, p, b) for (t, n, p, b) in all_cases()}
 
 
-def is_gen(key: str) -> bool:
-    return key.startswith("gen/")
-
-
 def key_file(work: str, key: str, suffix: str) -> str:
-    return os.path.join(work, "gen_state" if is_gen(key) else "state", key.replace("/", "__") + suffix)
+    return os.path.join(work, "state", key.replace("/", "__") + suffix)
 
 
 def save_routing(work: str, key: str, P: Problem, version: int) -> None:
@@ -82,8 +74,7 @@ class NetEvaluator:
         self.model, self.mtime, self.ready = None, 0.0, False
 
     def refresh(self) -> None:
-        import torch
-        from .model import load_model
+        from network.model import load_model
         try:
             mt = os.path.getmtime(self.path)
         except OSError:
@@ -100,7 +91,7 @@ class NetEvaluator:
     def __call__(self, reqs) -> List:
         """reqs: live states (encoded now) or Leafs (encoded earlier)."""
         import torch
-        from .model import collate
+        from network.model import collate
         feats = [r.feats if isinstance(r, Leaf) else encode(r.problem, r) for r in reqs]
         states = [r.st if isinstance(r, Leaf) else r for r in reqs]
         b = collate(feats, self.device)
@@ -210,7 +201,6 @@ def worker_main(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> No
 def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     import torch
     torch.set_num_threads(1)
-    device = torch.device("cuda" if torch.cuda.is_available() and not cfg.get("cpu") else "cpu")
     work = cfg["work"]
     rng = random.Random(cfg["seed"] * 1000 + wid)
     net = RemoteEvaluator(wid, infer_q, infer_resp_q, os.path.join(work, "net_ready"))
@@ -239,41 +229,19 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             return None
         key, hint = msg
         t0 = time.time()
-        gen = is_gen(key)
-        if gen:
-            path, ref = cfg["gen_cases"][key]
-            base = None
-        else:
-            tier, name, path, base = ALL[key]
+        tier, name, path, base = ALL[key]
         P = cache.get(key)
         ver = stored_version(work, key)
         if P is None or getattr(P, "_version", None) != ver:
-            if gen:
-                # a generated file that does not load is skipped for the rest of the run
-                try:
-                    if P is None:
-                        P = Problem.load(path)
-                    if load_routing(work, key) is None:
-                        P.restore_submission(ref)
-                except Exception as e:
-                    req_q.put(("log", wid, f"{key}: skipped, could not load ({type(e).__name__}: {e})"))
-                    req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
-                    cache.pop(key, None)
-                    return acquire()
             if P is None:
                 P = Problem.load(path)
             stored = load_routing(work, key)
             if stored is None:
-                if gen:
-                    base = P.router.total_delay()
-                else:
-                    big = P.W * P.H * P.L > 300_000
-                    ok = P.initial_route(schedules=[P.SCHEDULES[0]] if big else None,
-                                         orders=None)
-                    if not ok:
-                        req_q.put(("log", wid, f"{key}: initial routing failed"))
-                        req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
-                        return acquire()
+                big = P.W * P.H * P.L > 300_000
+                if not P.initial_route(schedules=[P.SCHEDULES[0]] if big else None):
+                    req_q.put(("log", wid, f"{key}: initial routing failed"))
+                    req_q.put(("done", key, {"seconds": time.time() - t0, "failed": True}))
+                    return acquire()
                 ver = 0
                 save_routing(work, key, P, ver)
                 init = {"initial_delay": P.router.total_delay(), "lower_bound": P.lower_bound, "baseline": base}
@@ -301,8 +269,7 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             s.pending_req = s.next_request()
             return s
         imp = Improver(P, random.Random(rng.randrange(2 ** 32)))
-        if not gen:
-            greedy_until_stall(imp, stall_tries=cfg["stall_tries"], max_seconds=cfg["greedy_seconds"])
+        greedy_until_stall(imp, stall_tries=cfg["stall_tries"], max_seconds=cfg["greedy_seconds"])
         frac = (P.router.total_delay() - P.lower_bound) / max(1, P.lower_bound)
         n_search = 0 if frac < cfg["min_excess"] else int(min(cfg["max_search"], max(4, round(P.N * frac))))
         net.refresh()
@@ -326,10 +293,9 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             ver = s.version + 1
             save_routing(work, key, P, ver)
             P._version = ver
-            if not is_gen(key):          # generated cases are never exported: no replay log
-                with open(key_file(work, key, ".replay.jsonl"), "a") as f:
-                    for e in s.imp.log:
-                        f.write(json.dumps(e) + "\n")
+            with open(key_file(work, key, ".replay.jsonl"), "a") as f:
+                for e in s.imp.log:
+                    f.write(json.dumps(e) + "\n")
             s.imp.log.clear()
         if s.records:
             out = {k: np.stack([r[k] for r in s.records]) for k in s.records[0]}

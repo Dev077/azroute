@@ -1,12 +1,9 @@
 # azroute: network, loss and settings
 
-What to expect from a run: [RUN_EXPECTATIONS.md](RUN_EXPECTATIONS.md).
-
-Current defaults, read off the code (`model.py`, `features.py`, `learner.py`, `search.py`,
-`lns.py`, `modes.py`, `problem.py`, `run.py`). Command-line flags of `python -m azroute.run`
+Current defaults, read off the code (`network/model.py`, `network/features.py`,
+`network/learner.py`, `search/search.py`, `routing/lns.py`, `routing/modes.py`,
+`routing/problem.py`, `pipeline/run.py`). Command-line flags of `python -m pipeline.run`
 are given where a setting has one.
-
-![architecture](architecture.svg)
 
 ## Network: 10.33 M parameters, 11.9 GFLOPs per sample
 
@@ -138,8 +135,7 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 | reroute region | union of the nets' pin boxes + 6 |
 | accept | new neighbourhood delay <= old (training visits) |
 | polish visits | `--polish-workers` (default half the workers) only polish scored cases: `--polish-minutes` (30) network-free visits (32/8 simulations, 16 candidates, 3-8 nets), no training records. A worse reroute is kept while the case total stays within `--polish-tau` (0.3 %) of the visit's best total, the margin shrinking linearly to 0 over the visit (record-to-record travel); the visit ends on its best routing, saved with its replay log. The dispatcher sends a polish worker to the free scored case with the highest recent gain per polish minute (never-polished first), the priority growing with the time since its last polish. Measured on the hard tier from a long run's routings, 1 h per case: +2.3 % vs +0.9 % with the strict rule (`accept_bench.py`). |
-| greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s; skipped on generated cases |
-| generated training cases | `--gen-dirs`; start from their reference solution, get `--gen-share` (0.5) of visits, never exported; their worker time is charged to the scored cases' runtime |
+| greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s |
 | search reroutes per visit | clamp(round(#nets x excess / lower bound), 4, 64); none if excess < 0.3 % |
 
 ### Routing modes

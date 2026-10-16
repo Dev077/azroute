@@ -2,7 +2,7 @@
 same network-free reroutes for the same time per case under each rule, keep the best routing
 each one finds, and report the tier scores (geometric mean of baseline / delay).
 
-    python -m azroute.accept_bench --tier hard --seconds 600 --from /path/to/run_work
+    python -m tools.accept_bench --tier hard --seconds 600 --from /path/to/run_work
 
 `--from` is a run's work (or Drive) folder: its state/<tier>__<case>.npz routings are the starting
 points. Without it, each case starts from the initial routing plus greedy rerouting until it stalls
@@ -18,11 +18,11 @@ import os
 import random
 import time
 
-from .lns import Acceptance, Improver, LateAcceptance, RecordToRecord, greedy_policy, greedy_until_stall
-from .problem import Problem
-from .search import Search, completion_evaluator, drive
-from .tiers import cases
-from .worker import load_routing, save_routing
+from routing.lns import Acceptance, Improver, LateAcceptance, RecordToRecord, greedy_policy, greedy_until_stall
+from routing.problem import Problem
+from search.search import Search, completion_evaluator, drive
+from routing.tiers import cases
+from pipeline.worker import load_routing, save_routing
 
 
 def make_rule(spec: str, a) -> Acceptance:

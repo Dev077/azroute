@@ -5,7 +5,7 @@ import json
 import os
 from typing import Dict, List, Tuple
 
-from .paths import CHALLENGE_ROOT as ROOT
+from routing.paths import CHALLENGE_ROOT as ROOT
 
 TIER_DIRS: Dict[str, str] = {
     "intro": "benchmarks",

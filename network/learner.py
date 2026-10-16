@@ -10,15 +10,14 @@ Loss (per batch):
 """
 from __future__ import annotations
 
-import math
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .features import BIT_FUTURE, CROP, GLOBAL_FEATS, MAX_NETS, N_MODES, NODE_FEATS, PAIR_FEATS
-from .model import RouteNet
+from network.features import BIT_FUTURE, CROP, GLOBAL_FEATS, MAX_NETS, N_MODES, NODE_FEATS, PAIR_FEATS
+from network.model import RouteNet
 
 FIELDS = {
     "maps": ((None, CROP, CROP), np.uint8),     # (L, 64, 64); filled with L at construction

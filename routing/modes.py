@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from . import _core
+from core import _core
 
 TIE_RESERVE = 1e-3   # entering a reserved pin column (pin access for not-yet-routed nets)
 TIE_WIRE = 1e-5      # per new vertex: among equal-delay trees prefer the one using fewer resources

@@ -1,6 +1,6 @@
 """Train and solve: workers improve the challenge cases while the learner trains the network.
 
-    python -m azroute.run --hours 23.5 --work /content/work --drive /content/drive/MyDrive/azroute
+    python -m pipeline.run --hours 23.5 --work /content/work --drive /content/drive/MyDrive/azroute
 
 Resumable: on start it restores <drive> into <work> (case routings, replay logs, model,
 learner checkpoint, stats); every --sync-minutes it copies <work> back to <drive>. At the
@@ -16,7 +16,6 @@ import os
 import queue
 import random
 import shutil
-import sys
 import time
 
 import numpy as np
@@ -65,23 +64,6 @@ def auto_workers(requested: int, gpu_gb: float) -> int:
     return int(max(1, min(cpus - 4, 64, (ram_gb - 16) // 3, gpu_cap)))
 
 
-def load_gen_cases(dirs: str) -> dict:
-    """Generated training-only cases: {"gen/<folder>_<stem>": (instance path, reference .sol.json)}
-    for every <stem>.json in each folder that has a <stem>.ref.sol.json next to it."""
-    out = {}
-    for d in [x for x in dirs.split(",") if x.strip()]:
-        d = d.strip()
-        tag = os.path.basename(os.path.normpath(d))
-        for f in sorted(os.listdir(d)):
-            if not f.endswith(".json") or f.count(".") != 1 or f == "index.json":
-                continue
-            stem = f[:-5]
-            ref = os.path.join(d, stem + ".ref.sol.json")
-            if os.path.exists(ref):
-                out[f"gen/{tag}_{stem}"] = (os.path.join(d, f), ref)
-    return out
-
-
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default="/content/work")
@@ -97,8 +79,6 @@ def main(argv=None) -> None:
     ap.add_argument("--replay-ratio", type=float, default=16.0, help="max samples trained per record collected")
     ap.add_argument("--prio", type=float, default=0.5,
                     help="share of each batch drawn in proportion to the record's decision spread")
-    ap.add_argument("--gen-dirs", default="", help="comma list of folders of generated training-only cases")
-    ap.add_argument("--gen-share", type=float, default=0.5, help="share of visits given to generated cases")
     ap.add_argument("--control-share", type=float, default=0.1,
                     help="share of visits that stay network-free after the handoff (for comparison)")
     ap.add_argument("--gumbel-scale", type=float, default=1.0,
@@ -132,9 +112,9 @@ def main(argv=None) -> None:
     a = ap.parse_args(argv)
 
     import torch
-    from .learner import ReplayBuffer, Trainer
-    from .model import RouteNet, load_model, save_model
-    from .tiers import TIER_DIRS, all_cases
+    from network.learner import ReplayBuffer, Trainer
+    from network.model import RouteNet, load_model, save_model
+    from routing.tiers import TIER_DIRS, all_cases
 
     if a.smoke:
         a.model = "tiny"
@@ -142,7 +122,7 @@ def main(argv=None) -> None:
         a.tiers = a.tiers if a.tiers != "all" else "hard"
 
     work = os.path.abspath(a.work)
-    for d in ("state", "gen_state", "records"):
+    for d in ("state", "records"):
         os.makedirs(os.path.join(work, d), exist_ok=True)
     if a.drive and os.path.isdir(a.drive):
         log(f"resuming from {a.drive}")
@@ -170,14 +150,11 @@ def main(argv=None) -> None:
     if a.smoke:
         cases = cases[:2]
     base = {f"{t}/{n}": b for (t, n, _p, b) in all_cases()}
-    gen_cases = load_gen_cases(a.gen_dirs) if a.gen_dirs else {}
-    if a.gen_dirs:
-        log(f"{len(gen_cases)} generated training cases from {a.gen_dirs}")
 
     device = torch.device("cuda" if torch.cuda.is_available() and not a.cpu else "cpu")
     gpu_gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30 if device.type == "cuda" else 0.0
     W = auto_workers(a.workers, gpu_gb) if not a.smoke else 2
-    C = a.concurrency or max(1, min(2, (len(cases) + len(gen_cases)) // W))
+    C = a.concurrency or max(1, min(2, len(cases) // W))
     PW = min(W - 1, W // 2 if a.polish_workers < 0 else a.polish_workers) if W > 1 else 0
     if a.batch:
         batch = a.batch
@@ -200,17 +177,17 @@ def main(argv=None) -> None:
            "min_excess": 0.003, "max_search": 64 if not a.smoke else 3, "n_full": a.n_full,
            "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": a.gumbel_scale, "considered": a.considered,
            "considered_fast": a.considered_fast, "k_min": 3, "k_max": a.k_max,
-           "control_share": a.control_share, "explore_fast": a.explore_fast, "gen_cases": gen_cases,
+           "control_share": a.control_share, "explore_fast": a.explore_fast,
            # polish visits use the settings measured in accept_bench (network-free search, 3-8 nets)
            "polish_workers": PW, "polish_seconds": a.polish_minutes * 60, "polish_tau": a.polish_tau,
            "polish_search": dict(n_full=32, n_fast=8, p_full=0.25, considered=16, k_min=3, k_max=8)}
     run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C,
                    polish_workers=PW, batch=batch, buffer=cap, device=str(device),
-                   cases=len(cases), gen_cases=len(gen_cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
+                   cases=len(cases), gpu=torch.cuda.get_device_name(0) if device.type == "cuda" else None,
                    cpus=os.cpu_count())
     json.dump(run_cfg, open(os.path.join(work, "run_config.json"), "w"), indent=1)
     log(f"device={device} gpu={run_cfg['gpu']} cpus={os.cpu_count()} workers={W} (polish {PW}) concurrency={C} "
-        f"batch={batch} buffer={cap} cases={len(cases)} gen_cases={len(gen_cases)}")
+        f"batch={batch} buffer={cap} cases={len(cases)}")
 
     # -- learner -------------------------------------------------------------------
     model_path = os.path.join(work, "model.pt")
@@ -257,10 +234,10 @@ def main(argv=None) -> None:
     ctx = mp.get_context("spawn")
     req_q = ctx.Queue()
     resp_qs = [ctx.Queue() for _ in range(W)]
-    from .worker import worker_main
+    from pipeline.worker import worker_main
     infer_q = ctx.Queue()
     infer_resp_qs = [ctx.Queue() for _ in range(W)]
-    from .inference import inference_main
+    from network.inference import inference_main
     infer_proc = ctx.Process(target=inference_main, args=(cfg, infer_q, infer_resp_qs, req_q), daemon=True)
     infer_proc.start()
     def spawn(i):
@@ -272,8 +249,6 @@ def main(argv=None) -> None:
     procs = [spawn(i) for i in range(W)]
 
     order: list = []
-    gen_order: list = []
-    gen_rng = random.Random(a.seed + 1)
     busy: set = set()
     held = {i: set() for i in range(W)}     # cases each worker is on, released if it crashes
     bad: set = set()                        # cases skipped for the rest of the run
@@ -288,20 +263,7 @@ def main(argv=None) -> None:
     stopping = False
     polish_log: list = []                   # relative gain of each polish visit since the last status line
 
-    def gen_stats(k):
-        return {"tier": "gen", "case": k[4:], "baseline": None, "seconds": 0.0, "visits": 0, "records": 0}
-
-    def next_gen():
-        nonlocal gen_order
-        for _ in range(2):
-            for i, k in enumerate(gen_order):
-                if k not in busy and k not in bad:
-                    gen_order.pop(i)
-                    return k
-            gen_order = gen_order + gen_rng.sample(list(gen_cases), len(gen_cases))
-        return None
-
-    def next_scored():
+    def next_case():
         nonlocal order
         for _ in range(2):
             for i, k in enumerate(order):
@@ -310,12 +272,6 @@ def main(argv=None) -> None:
                     return k
             order = order + random.Random(int(rng.integers(1 << 30))).sample(cases, len(cases))
         return None
-
-    def next_case():
-        # when polish workers hold most scored cases, training visits fall back to generated ones
-        if gen_cases and gen_rng.random() < a.gen_share:
-            return next_gen() or next_scored()
-        return next_scored() or (next_gen() if gen_cases else None)
 
     def next_polish():
         """The free scored case with the most expected gain: never-polished cases first, then by
@@ -354,9 +310,7 @@ def main(argv=None) -> None:
             busy.discard(k)
             for h in held.values():
                 h.discard(k)
-            if st.get("failed") and k.startswith("gen/"):
-                bad.add(k)
-            s = stats.setdefault(k, gen_stats(k))
+            s = stats[k]
             if st.get("polish") and "delay" in st:
                 gain = (st["start"] - st["delay"]) / max(1, st["start"])
                 rate = gain / max(1.0, st.get("seconds", 0.0) / 60)
@@ -374,7 +328,7 @@ def main(argv=None) -> None:
             visits_f.write(json.dumps({"t": time.time(), "case": k, **st}) + "\n")
             visits_f.flush()
         elif kind == "init":
-            stats.setdefault(msg[1], gen_stats(msg[1])).update(msg[2])
+            stats[msg[1]].update(msg[2])
             stats[msg[1]]["best"] = msg[2]["initial_delay"]
         elif kind == "log":
             log(f"{msg[1] if isinstance(msg[1], str) else 'worker ' + str(msg[1])}: {msg[2]}")
@@ -430,9 +384,8 @@ def main(argv=None) -> None:
 
     def summary() -> str:
         parts = []
-        for t in tiers + (["gen"] if gen_cases else []):
-            rs = [s for k, s in stats.items() if not k.startswith("_") and s["tier"] == t and s.get("best")
-                  and s.get("baseline")]
+        for t in tiers:
+            rs = [s for k, s in stats.items() if not k.startswith("_") and s["tier"] == t and s.get("best")]
             if rs:
                 gm = math.exp(sum(math.log(s["baseline"] / s["best"]) for s in rs) / len(rs))
                 parts.append(f"{t}={gm:.4f}({len(rs)})")
@@ -503,7 +456,7 @@ def main(argv=None) -> None:
     save_all()
     sync(work, a.drive)
     log(f"stopped. {summary()}")
-    from .export import export
+    from pipeline.export import export
     out = os.path.join(a.drive or work, "export")
     export(work, out)
     log(f"exported submissions to {out}")

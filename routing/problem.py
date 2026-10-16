@@ -1,16 +1,16 @@
 """One challenge case loaded into the C++ router core."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .paths import CHALLENGE_ROOT  # noqa: F401  (puts the challenge checkout on sys.path)
+from routing.paths import CHALLENGE_ROOT  # noqa: F401  (puts the challenge checkout on sys.path)
 from m3d.checker import check  # noqa: E402
 from m3d.model import Instance, NetRoute, Submission  # noqa: E402
 
-from . import _core  # noqa: E402
-from .modes import make_modes, negotiation_mode  # noqa: E402
+from core import _core  # noqa: E402
+from routing.modes import make_modes, negotiation_mode  # noqa: E402
 
 Box = Tuple[int, int, int, int]
 
@@ -116,15 +116,6 @@ class Problem:
         for i, edges in enumerate(snap):
             r.set_route(i, edges)
         r.commit()
-
-    def restore_submission(self, path: str) -> None:
-        """Install the routes of a .sol.json (e.g. a generated case's reference solution)."""
-        sub = Submission.load(path)
-        index = {nid: i for i, nid in enumerate(self.net_ids)}
-        snap = [[] for _ in range(self.N)]
-        for r in sub.routes:
-            snap[index[r.net]] = [(self.vid(a), self.vid(b)) for a, b in r.edges]
-        self.restore(snap)
 
     # -- export -----------------------------------------------------------------
     def to_submission(self) -> Submission:

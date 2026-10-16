@@ -18,9 +18,8 @@ import os
 import queue
 import time
 import traceback
-from typing import Dict, List
+from typing import Dict
 
-import numpy as np
 
 MAX_BATCH = 768          # workers send a whole halving round per request
 GATHER_SECONDS = 0.002      # after the first request, wait this long for more to join the batch
@@ -37,7 +36,7 @@ def inference_main(cfg: Dict, infer_q, infer_resp_qs, log_q) -> None:
 
 def _serve(cfg: Dict, infer_q, infer_resp_qs, log_q) -> None:
     import torch
-    from .model import collate, load_model
+    from network.model import collate, load_model
     torch.set_num_threads(2)
     device = torch.device("cuda" if torch.cuda.is_available() and not cfg.get("cpu") else "cpu")
     path = os.path.join(cfg["work"], "model.pt")

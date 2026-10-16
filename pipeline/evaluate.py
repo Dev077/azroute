@@ -1,6 +1,6 @@
 """One-shot test of a trained network: route every case from scratch, no training, no polish.
 
-    python -m azroute.evaluate --model /content/drive/MyDrive/azroute_run/model.pt \
+    python -m pipeline.evaluate --model /content/drive/MyDrive/azroute_run/model.pt \
         --work /content/eval_network --out /content/drive/MyDrive/azroute_eval/network --minutes 10
 
 Each case starts from its initial routing (negotiated congestion) and gets --minutes of worker
@@ -56,15 +56,15 @@ def main(argv=None) -> None:
     a = ap.parse_args(argv)
 
     import torch
-    from .export import export
-    from .model import load_model
-    from .run import auto_workers
-    from .tiers import TIER_DIRS, all_cases
+    from pipeline.export import export
+    from network.model import load_model
+    from pipeline.run import auto_workers
+    from routing.tiers import TIER_DIRS, all_cases
 
     work = os.path.abspath(a.work)
     if os.path.isdir(os.path.join(work, "state")) and os.listdir(os.path.join(work, "state")):
         raise SystemExit(f"{work} already holds routings; use a new --work directory for a one-shot test")
-    for d in ("state", "gen_state", "records"):
+    for d in ("state", "records"):
         os.makedirs(os.path.join(work, d), exist_ok=True)
     for f in ("STOP", "net_ready", "model.pt"):
         if os.path.exists(os.path.join(work, f)):
@@ -97,7 +97,7 @@ def main(argv=None) -> None:
            "concurrency": 1, "cache_cases": 2, "stall_tries": 200, "greedy_seconds": 15.0,
            "min_excess": 0.003, "max_search": 64, "n_full": a.n_full, "n_fast": a.n_fast, "p_full": a.p_full,
            "gumbel_scale": a.gumbel_scale, "considered": a.considered, "considered_fast": a.considered_fast,
-           "k_min": 3, "k_max": a.k_max, "control_share": 0.0, "explore_fast": True, "gen_cases": {},
+           "k_min": 3, "k_max": a.k_max, "control_share": 0.0, "explore_fast": True,
            "polish_workers": 0, "polish_seconds": 0.0, "polish_tau": 0.0, "polish_search": {}}
     json.dump(dict(vars(a), workers=W, device=str(device), cases=len(cases)),
               open(os.path.join(work, "eval_config.json"), "w"), indent=1)
@@ -111,8 +111,8 @@ def main(argv=None) -> None:
     done: set = set()       # cases out of budget, stalled, or failed
     busy: set = set()
 
-    from .inference import inference_main
-    from .worker import worker_main
+    from network.inference import inference_main
+    from pipeline.worker import worker_main
     ctx = mp.get_context("spawn")
     for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(v, "1")

@@ -30,8 +30,8 @@ from typing import Callable, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 
-from .features import MAX_NETS, N_MODES, decision_index, encode, future_bits
-from .lns import Decision, Improver, Neighbourhood, RerouteState
+from network.features import MAX_NETS, N_MODES, decision_index, encode, future_bits
+from routing.lns import Decision, Improver, Neighbourhood, RerouteState
 
 C_VISIT = 50.0
 C_SCALE = 0.1

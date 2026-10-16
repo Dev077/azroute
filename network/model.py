@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .features import CROP, GLOBAL_FEATS, MAX_NETS, N_MODES, NODE_FEATS, PAIR_FEATS
+from network.features import CROP, GLOBAL_FEATS, N_MODES, NODE_FEATS, PAIR_FEATS
 
 N_BITS = 6          # input bits 0..5 per layer (bit 6 is a training target)
 GEOM_FEATS = 6

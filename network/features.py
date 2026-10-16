@@ -30,7 +30,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from .modes import MODE_NAMES
+from routing.modes import MODE_NAMES
 
 CROP = 64
 MAX_NETS = 16

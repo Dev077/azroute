@@ -17,8 +17,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .modes import KEEP, MODE_NAMES
-from .problem import Box, Problem
+from routing.modes import KEEP, MODE_NAMES
+from routing.problem import Box, Problem
 
 Decision = Tuple[int, str]  # (net index, mode name)
 
@@ -63,7 +63,7 @@ def pack_price(crop_u8: np.ndarray) -> str:
 
 
 def unpack_price(s: str, L: int) -> np.ndarray:
-    from .features import CROP
+    from network.features import CROP
     return np.frombuffer(base64.b64decode(s), dtype=np.uint8).reshape(L, CROP, CROP)
 
 
@@ -190,7 +190,7 @@ class Improver:
             price = None
             if mode == "LEARNED_PRICE":
                 if price_crop is not None:
-                    from .features import price_full
+                    from network.features import price_full
                     packed = pack_price(price_crop)
                     price = price_full(self.P, st.hood, price_crop.astype(np.float32) / 255.0)
                 else:
