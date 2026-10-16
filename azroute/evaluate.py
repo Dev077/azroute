@@ -197,8 +197,11 @@ def main(argv=None) -> None:
 
     last_log = time.time()
     while True:
+        # drain for at most 1 s: idle workers ask for a case every second, so with many of them
+        # the queue is never empty for 0.2 s and the checks below would never run
+        t_drain = time.time()
         try:
-            while True:
+            while time.time() - t_drain < 1.0:
                 handle(req_q.get(timeout=0.2))
         except queue.Empty:
             pass

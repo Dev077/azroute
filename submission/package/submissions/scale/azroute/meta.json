@@ -1,0 +1,8 @@
+{
+ "author": "Dev",
+ "url": "",
+ "method": "rip-up and reroute with search over reroute decisions, guided by a CNN + net-interaction network trained offline on the benchmark cases; up to 20 min per case",
+ "date": "2026-10-15",
+ "hardware": "AMD EPYC 9B45 (48 threads), NVIDIA RTX PRO 6000 Blackwell Server Edition, 177 GB RAM (Colab G4)",
+ "threads": 44
+}
