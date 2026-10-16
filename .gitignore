@@ -7,7 +7,7 @@ dist/
 *.egg-info/
 .DS_Store
 
-# the built C++ core (python setup.py)
+# the built C++ core (python core/build.py)
 *.so
 
 # run state and outputs
