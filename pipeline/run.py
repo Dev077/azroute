@@ -104,7 +104,7 @@ def main(argv=None) -> None:
     ap.add_argument("--n-fast", type=int, default=8)
     ap.add_argument("--p-full", type=float, default=0.25)
     ap.add_argument("--model", default="default", choices=["default", "small", "tiny"],
-                    help="network preset (model.PRESETS): default ~10M params, small ~3.7M, tiny for tests")
+                    help="network preset (model.PRESETS): default ~10M params, small ~3.7M, tiny for smoke runs")
     ap.add_argument("--sync-minutes", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true", help="force CPU (local testing)")
@@ -178,7 +178,7 @@ def main(argv=None) -> None:
            "n_fast": a.n_fast, "p_full": a.p_full, "gumbel_scale": a.gumbel_scale, "considered": a.considered,
            "considered_fast": a.considered_fast, "k_min": 3, "k_max": a.k_max,
            "control_share": a.control_share, "explore_fast": a.explore_fast,
-           # polish visits use the settings measured in accept_bench (network-free search, 3-8 nets)
+           # polish visits: network-free search, 3-8 nets
            "polish_workers": PW, "polish_seconds": a.polish_minutes * 60, "polish_tau": a.polish_tau,
            "polish_search": dict(n_full=32, n_fast=8, p_full=0.25, considered=16, k_min=3, k_max=8)}
     run_cfg = dict(vars(a), deadline_epoch=deadline, start_epoch=start_epoch, workers=W, concurrency=C,

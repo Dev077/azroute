@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Callable, Dict, Generator, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -80,16 +80,6 @@ def completion_evaluator(imp: Improver) -> Callable[[RerouteState], EvalResult]:
         r.rollback(cp)
         return np.zeros(len(st.pending) * N_MODES), score_total(st, total), None
     return evaluate
-
-
-def drive(gen: Generator, evaluate: Callable[[RerouteState], EvalResult]):
-    """Run a search generator to completion with a synchronous per-request evaluator."""
-    try:
-        req = next(gen)
-        while True:
-            req = gen.send([evaluate(x) for x in req])
-    except StopIteration as stop:
-        return stop.value
 
 
 class Node:

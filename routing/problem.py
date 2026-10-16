@@ -68,9 +68,6 @@ class Problem:
             x, y, _ = self.coord(v); xs.append(x); ys.append(y)
         return (min(xs), min(ys), max(xs), max(ys))
 
-    def full_box(self) -> Box:
-        return (0, 0, self.W - 1, self.H - 1)
-
     def grow(self, box: Box, margin: int) -> Box:
         x0, y0, x1, y1 = box
         return (max(0, x0 - margin), max(0, y0 - margin), min(self.W - 1, x1 + margin), min(self.H - 1, y1 + margin))

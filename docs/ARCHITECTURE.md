@@ -19,7 +19,7 @@ are given where a setting has one.
 | future head | conv 3x3 96 -> 96, ReLU, conv 1x1 -> 6 | 0.08 M |
 | trunk + heads | trunk 742 -> 256 -> 256; decision 256 -> 256 -> 7 per net; net excess 256 -> 128 -> 1; value; blocked | 0.36 M |
 
-Presets (`--model`): `default` 10.33 M, `small` 3.83 M (4.6 GFLOPs), `tiny` (tests and smoke runs).
+Presets (`--model`): `default` 10.33 M, `small` 3.83 M (4.6 GFLOPs), `tiny` (smoke runs).
 
 ### Grid backbone
 
@@ -134,7 +134,7 @@ loss = KL(pi' || p)                       decision distribution; pi' = the searc
 | seed choice | random, weight = excess / (1 + recent failures) |
 | reroute region | union of the nets' pin boxes + 6 |
 | accept | new neighbourhood delay <= old (training visits) |
-| polish visits | `--polish-workers` (default half the workers) only polish scored cases: `--polish-minutes` (30) network-free visits (32/8 simulations, 16 candidates, 3-8 nets), no training records. A worse reroute is kept while the case total stays within `--polish-tau` (0.3 %) of the visit's best total, the margin shrinking linearly to 0 over the visit (record-to-record travel); the visit ends on its best routing, saved with its replay log. The dispatcher sends a polish worker to the free scored case with the highest recent gain per polish minute (never-polished first), the priority growing with the time since its last polish. Measured on the hard tier from a long run's routings, 1 h per case: +2.3 % vs +0.9 % with the strict rule (`accept_bench.py`). |
+| polish visits | `--polish-workers` (default half the workers) only polish scored cases: `--polish-minutes` (30) network-free visits (32/8 simulations, 16 candidates, 3-8 nets), no training records. A worse reroute is kept while the case total stays within `--polish-tau` (0.3 %) of the visit's best total, the margin shrinking linearly to 0 over the visit (record-to-record travel); the visit ends on its best routing, saved with its replay log. The dispatcher sends a polish worker to the free scored case with the highest recent gain per polish minute (never-polished first), the priority growing with the time since its last polish. Measured on the hard tier from a long run's routings, 1 h per case: +2.3 % vs +0.9 % with the strict rule. |
 | greedy phase per visit | 3-net neighbourhoods, DELAY mode, until 200 tries in a row bring no gain or 15 s |
 | search reroutes per visit | clamp(round(#nets x excess / lower bound), 4, 64); none if excess < 0.3 % |
 

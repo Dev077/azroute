@@ -92,26 +92,6 @@ class RecordToRecord(Acceptance):
         return after <= before or after <= best * (1.0 + self.tau * left)
 
 
-class LateAcceptance(Acceptance):
-    """Also keep a worse reroute if the new total is no worse than the total `length`
-    finished reroutes ago (late acceptance hill climbing)."""
-    name = "lahc"
-
-    def __init__(self, length: int):
-        self.length, self.hist, self.v = length, [], 0
-
-    def ok(self, before: int, after: int, best: int) -> bool:
-        if not self.hist:
-            self.hist = [before] * self.length
-        return after <= before or after <= self.hist[self.v % self.length]
-
-    def tick(self, total: int) -> None:
-        if not self.hist:
-            self.hist = [total] * self.length
-        self.hist[self.v % self.length] = total
-        self.v += 1
-
-
 class Improver:
     def __init__(self, problem: Problem, rng: random.Random, max_nets: int = 6,
                  seed_margin: int = 3, region_margin: int = 6, accept: Optional[Acceptance] = None):

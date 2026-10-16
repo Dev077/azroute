@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from network.features import decision_index, encode
+from network.features import decision_index
 from routing.lns import Improver, RecordToRecord, greedy_until_stall
 from routing.problem import Problem
 from search.search import Leaf, Search, completion_evaluator, score_total
@@ -64,45 +64,6 @@ def stored_version(work: str, key: str) -> int:
     if not os.path.exists(path):
         return -1
     return int(np.load(path)["version"])
-
-
-class NetEvaluator:
-    """Batched network evaluation of reroute states; reloads weights when the learner publishes."""
-
-    def __init__(self, path: str, device):
-        self.path, self.device = path, device
-        self.model, self.mtime, self.ready = None, 0.0, False
-
-    def refresh(self) -> None:
-        from network.model import load_model
-        try:
-            mt = os.path.getmtime(self.path)
-        except OSError:
-            return
-        if mt == self.mtime:
-            return
-        try:
-            m, ck = load_model(self.path, self.device)
-        except Exception:
-            return               # being written; try again next time
-        m.eval()
-        self.model, self.mtime, self.ready = m, mt, bool(ck.get("net_ready", False))
-
-    def __call__(self, reqs) -> List:
-        """reqs: live states (encoded now) or Leafs (encoded earlier)."""
-        import torch
-        from network.model import collate
-        feats = [r.feats if isinstance(r, Leaf) else encode(r.problem, r) for r in reqs]
-        states = [r.st if isinstance(r, Leaf) else r for r in reqs]
-        b = collate(feats, self.device)
-        with torch.no_grad(), torch.autocast(self.device.type, dtype=torch.bfloat16,
-                                             enabled=self.device.type == "cuda"):
-            out = self.model(b["maps"], b["nodes"], b["rois"], b["glob"], b["legal"], b["ld"], b["pairs"])
-        logits = out["logits"].float().cpu().numpy()
-        y = (out["y"].float() * self.model.y_sigma + self.model.y_mu).cpu().numpy()
-        fb = torch.sigmoid(out["blocked"].float()).cpu().numpy()
-        price = (torch.sigmoid(out["future"].float()) * 255).round().to(torch.uint8).cpu().numpy()
-        return to_results(states, logits, y, fb, price)
 
 
 def to_results(states, logits, y, fb, price) -> List:

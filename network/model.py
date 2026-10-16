@@ -43,7 +43,7 @@ PRESETS = {
     "default": dict(widths=(96, 160, 224), depths=(2, 3, 3), dim=256, pair_dim=64, heads=8, net_layers=3),
     # ~2.5 M: if network calls turn out to be the bottleneck
     "small": dict(widths=(64, 96, 160), depths=(2, 2, 3), dim=160, pair_dim=32, heads=4, net_layers=2),
-    # for tests and the local smoke run
+    # for the local smoke run
     "tiny": dict(widths=(8, 16, 16), depths=(1, 1, 1), dim=16, pair_dim=8, heads=2, net_layers=1),
 }
 

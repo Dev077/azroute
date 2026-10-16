@@ -104,7 +104,7 @@ r.rollback(cp)
 ```
 
 Every accepted reroute is logged together with any network output it used. As a result, each
-final routing can be replayed bit-for-bit from the initial routing, and the tests check this.
+final routing can be replayed bit-for-bit from the initial routing (`routing.lns.replay`).
 
 ### 3. Routing decisions
 
@@ -251,9 +251,7 @@ routing/     a case loaded into the core, routing modes, the improvement loop, t
 search/      Gumbel sequential-halving search over routing decisions; training records
 network/     input encoding, the network, the learner, the batched inference process
 pipeline/    the training run, worker processes, checked export
-tools/       acceptance-rule benchmark
 notebooks/   Colab notebook for the training run
-tests/       legality and exact delay vs the m3d checker, rollback, exact replay, network plumbing
 docs/        every setting, the loss and the network in detail (ARCHITECTURE.md)
 submission/  the submitted run: per-tier metadata, runtimes and layer animations
 ```
