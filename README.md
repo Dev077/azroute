@@ -252,7 +252,7 @@ search/      Gumbel sequential-halving search over routing decisions; training r
 network/     input encoding, the network, the learner, the batched inference process
 pipeline/    the training run, worker processes, one-shot evaluation, checked export
 tools/       acceptance-rule benchmark
-notebooks/   Colab notebooks for training and evaluation
+notebooks/   Colab notebook for the training run
 tests/       legality and exact delay vs the m3d checker, rollback, exact replay, network plumbing
 docs/        every setting, the loss and the network in detail (ARCHITECTURE.md)
 submission/  the submitted run: per-tier metadata, runtimes and layer animations
