@@ -1,7 +1,7 @@
-<h1 align="center">kappa</h1>
+<h1 align="center">azroute</h1>
 
 <p align="center">
-  <b>azroute: a learned router for 3D integrated circuits</b><br>
+  <b>A learned router for 3D integrated circuits</b><br>
   <sub>Search-guided rip-up-and-reroute with a 10 M-parameter network, trained AlphaZero-style on its own search</sub>
 </p>
 
