@@ -1,7 +1,7 @@
 """One challenge case loaded into the C++ router core."""
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -83,17 +83,16 @@ class Problem:
     # -- initial routing --------------------------------------------------------
     SCHEDULES = [(0.3, 1.2, 0.3), (0.5, 1.3, 0.5), (0.5, 1.5, 0.5)]  # (pres0, pres_mult, hist_fac)
 
-    def initial_route(self, orders: Optional[List[List[int]]] = None, max_iters: int = 300,
-                      schedules=None) -> bool:
-        """Negotiated congestion over several (net order, schedule) pairs; keep the best legal result."""
-        if orders is None:
-            by_bbox = sorted(range(self.N), key=lambda i: (-self.bbox_semi(i), i))
-            orders = [by_bbox, list(reversed(by_bbox))]
+    def initial_route(self, schedules=None) -> bool:
+        """Negotiated congestion over two net orders (largest box first, and the reverse) and
+        several pressure schedules; keep the best legal result."""
+        by_bbox = sorted(range(self.N), key=lambda i: (-self.bbox_semi(i), i))
+        orders = [by_bbox, list(reversed(by_bbox))]
         m = negotiation_mode(self.layer_delay)
         best, best_routes = None, None
         for sched in schedules or self.SCHEDULES:
             for order in orders:
-                if self.router.negotiate(order, m, max_iters, *sched):
+                if self.router.negotiate(order, m, 300, *sched):
                     d = self.router.total_delay()
                     if best is None or d < best:
                         best, best_routes = d, self.snapshot()

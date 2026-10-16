@@ -24,7 +24,6 @@ namespace py = pybind11;
 
 struct ModeParams {
     std::vector<double> layer_mult;  // per-layer multiplier on in-layer edge delay (search cost only)
-    double via_mult = 1.0;           // multiplier on via delay (search cost only)
     double price_weight = 0.0;       // secondary cost: price_weight * price[v]
     double reserve_weight = 0.0;     // secondary cost for entering a reserved pin column
     double wire_weight = 0.0;        // secondary cost per newly added vertex
@@ -64,7 +63,6 @@ public:
         tdist_.assign(V_, 0);
         tcost_.assign(V_, 0.0);
         col_stamp_.assign(WH_, 0);
-        min_ld_ = *std::min_element(ld_.begin(), ld_.end());
         // per (z, tz): best line over horizontal layer z' -> h = a*dxy + b
         hline_.assign((size_t)L_ * L_, {});
         for (int z = 0; z < L_; ++z)
@@ -75,7 +73,6 @@ public:
     }
 
     int num_nets() const { return (int)drivers_.size(); }
-    int64_t num_vertices() const { return V_; }
 
     // ------------------------------------------------------------------ queries
     bool is_routed(int net) const { return routes_.at(net).routed; }
@@ -85,24 +82,8 @@ public:
         for (auto& r : routes_) s += r.delay;
         return s;
     }
-    bool all_routed() const {
-        for (auto& r : routes_)
-            if (!r.routed) return false;
-        return true;
-    }
     std::vector<int32_t> route_vertices(int net) const { return routes_.at(net).verts; }
     std::vector<std::pair<int32_t, int32_t>> route_edges(int net) const { return routes_.at(net).edges; }
-
-    py::array_t<int32_t> owner_array() const {
-        py::array_t<int32_t> a(V_);
-        std::copy(owner_.begin(), owner_.end(), a.mutable_data());
-        return a;
-    }
-    py::array_t<int32_t> pin_owner_array() const {
-        py::array_t<int32_t> a(V_);
-        std::copy(pin_owner_.begin(), pin_owner_.end(), a.mutable_data());
-        return a;
-    }
 
     // Owner and pin-owner of every vertex in the box [x0,x1]x[y0,y1] (all layers), shape (L, h, w).
     py::tuple crop(int x0, int y0, int x1, int y1) const {
@@ -305,13 +286,11 @@ public:
         auto add = [&](int n) { for (int32_t v : soft[n].verts) ++occ[v]; };
         auto remove = [&](int n) { for (int32_t v : soft[n].verts) --occ[v]; };
         for (int32_t n : order) {
-            if (!build(n, m, full, nullptr, {}, BlockNone{}, SoftCong{&occ, &hist, pres}, soft[n])) { last_overuse_ = -1; return false; }
+            if (!build(n, m, full, nullptr, {}, BlockNone{}, SoftCong{&occ, &hist, pres}, soft[n])) return false;
             add(n);
         }
         bool legal = false;
-        last_iters_ = 0;
         for (int it = 0; it < max_iters; ++it) {
-            last_iters_ = it + 1;
             std::vector<char> affected(N, 0);
             bool over = false;
             for (int n = 0; n < N; ++n)
@@ -325,7 +304,7 @@ public:
                 if (!affected[n]) continue;
                 remove(n);
                 Route r;
-                if (!build(n, m, full, nullptr, {}, BlockNone{}, SoftCong{&occ, &hist, pres}, r)) { last_overuse_ = -1; return false; }
+                if (!build(n, m, full, nullptr, {}, BlockNone{}, SoftCong{&occ, &hist, pres}, r)) return false;
                 soft[n] = std::move(r);
                 add(n);
             }
@@ -335,20 +314,9 @@ public:
             for (int64_t v = 0; v < V_ && legal; ++v)
                 if (occ[v] > 1) legal = false;
         }
-        last_overuse_ = 0;
-        for (int64_t v = 0; v < V_; ++v)
-            if (occ[v] > 1) ++last_overuse_;
         if (!legal) return false;
         for (int n = 0; n < N; ++n) install(n, std::move(soft[n]));
         return true;
-    }
-
-    std::pair<int, int64_t> negotiate_stats() const { return {last_iters_, last_overuse_}; }
-
-    static ModeParams default_mode_for(int L) {
-        ModeParams m;
-        m.layer_mult.assign(L, 1.0);
-        return m;
     }
 
 private:
@@ -374,14 +342,18 @@ private:
         double operator()(int64_t v) const { return (1.0 + (*hist)[v]) * (1.0 + pres * (*occ)[v]); }
     };
 
-    ModeParams default_mode() const { return default_mode_for(L_); }
+    ModeParams default_mode() const {
+        ModeParams m;
+        m.layer_mult.assign(L_, 1.0);
+        return m;
+    }
 
     void check_mode(const ModeParams& m) const {
         if ((int)m.layer_mult.size() != L_) throw std::invalid_argument("mode.layer_mult needs one entry per layer");
         for (double x : m.layer_mult)
             if (x < 1.0) throw std::invalid_argument("mode.layer_mult entries must be >= 1 (keeps A* admissible)");
-        if (m.via_mult < 1.0 || m.price_weight < 0 || m.reserve_weight < 0 || m.wire_weight < 0)
-            throw std::invalid_argument("mode multipliers must be >= 1 and secondary weights >= 0");
+        if (m.price_weight < 0 || m.reserve_weight < 0 || m.wire_weight < 0)
+            throw std::invalid_argument("mode secondary weights must be >= 0");
     }
 
     Box to_box(const std::tuple<int, int, int, int>& t) const {
@@ -454,7 +426,7 @@ private:
         std::vector<std::array<int, 3>> tgt;
         auto edge_cost = [&](int64_t v, int z, bool via) -> std::pair<int, double> {
             int w = via ? via_ : ld_[z];
-            double c = w * (via ? m.via_mult : m.layer_mult[z]);
+            double c = via ? w : w * m.layer_mult[z];
             double cg = cong(v);
             if (cg != 1.0) c *= cg;
             if (price && m.price_weight != 0.0) c += m.price_weight * price[v];
@@ -559,7 +531,6 @@ private:
     int64_t WH_, V_;
     std::vector<int> ld_;
     int via_;
-    int min_ld_;
     std::vector<int32_t> drivers_;
     std::vector<std::vector<int32_t>> sinks_;
     std::vector<int32_t> pin_owner_, owner_;
@@ -572,8 +543,6 @@ private:
     std::vector<int64_t> tdist_;
     std::vector<uint32_t> dstamp_, cstamp_, tstamp_, target_stamp_, col_stamp_;
     uint32_t search_gen_ = 0, tree_gen_ = 0, col_gen_ = 0;
-    int last_iters_ = 0;
-    int64_t last_overuse_ = 0;
 };
 
 PYBIND11_MODULE(_core, mod) {
@@ -581,7 +550,6 @@ PYBIND11_MODULE(_core, mod) {
     py::class_<ModeParams>(mod, "ModeParams")
         .def(py::init<>())
         .def_readwrite("layer_mult", &ModeParams::layer_mult)
-        .def_readwrite("via_mult", &ModeParams::via_mult)
         .def_readwrite("price_weight", &ModeParams::price_weight)
         .def_readwrite("reserve_weight", &ModeParams::reserve_weight)
         .def_readwrite("wire_weight", &ModeParams::wire_weight)
@@ -591,16 +559,11 @@ PYBIND11_MODULE(_core, mod) {
         .def(py::init<int, int, int, std::vector<int>, int, const std::vector<int32_t>&,
                       const std::vector<int32_t>&, const std::vector<int32_t>&,
                       const std::vector<std::vector<int32_t>>&>())
-        .def("num_nets", &Router::num_nets)
-        .def("num_vertices", &Router::num_vertices)
         .def("is_routed", &Router::is_routed)
         .def("net_delay", &Router::net_delay)
         .def("total_delay", &Router::total_delay)
-        .def("all_routed", &Router::all_routed)
         .def("route_vertices", &Router::route_vertices)
         .def("route_edges", &Router::route_edges)
-        .def("owner_array", &Router::owner_array)
-        .def("pin_owner_array", &Router::pin_owner_array)
         .def("ideal_delay", &Router::ideal_delay)
         .def("crop", &Router::crop)
         .def("blockers", &Router::blockers)
@@ -613,6 +576,5 @@ PYBIND11_MODULE(_core, mod) {
         .def("checkpoint", &Router::checkpoint)
         .def("rollback", &Router::rollback)
         .def("commit", &Router::commit)
-        .def("negotiate", &Router::negotiate)
-        .def("negotiate_stats", &Router::negotiate_stats);
+        .def("negotiate", &Router::negotiate);
 }

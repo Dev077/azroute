@@ -50,10 +50,7 @@ class ReplayBuffer:
         m = len(batch["y"])
         for i in range(m):
             for k in FIELDS:
-                if k in batch:          # shards written before a field existed leave it at 0
-                    self.data[k][self.pos] = batch[k][i]
-                else:
-                    self.data[k][self.pos] = 0
+                self.data[k][self.pos] = batch[k][i]
             self.pos = (self.pos + 1) % self.cap
             self.n = min(self.n + 1, self.cap)
         return m

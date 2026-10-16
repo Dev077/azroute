@@ -19,7 +19,7 @@ are given where a setting has one.
 | future head | conv 3x3 96 -> 96, ReLU, conv 1x1 -> 6 | 0.08 M |
 | trunk + heads | trunk 742 -> 256 -> 256; decision 256 -> 256 -> 7 per net; net excess 256 -> 128 -> 1; value; blocked | 0.36 M |
 
-Presets (`--model`): `default` 10.33 M, `small` 3.83 M (4.6 GFLOPs), `tiny` (smoke runs).
+A `tiny` preset of the same network is used for smoke runs (`--smoke`).
 
 ### Grid backbone
 
@@ -172,4 +172,4 @@ back to DELAY if blocked.
 | workers | min(CPUs - 4, 64, (free RAM GB - 16) / 3, 0.55 x GPU GB); 44 on a G4 (48 CPUs) | `--workers` |
 | cases per worker at once | min(4, #cases / workers) | `--concurrency` |
 | network evaluation | one inference process holds the network on the GPU; workers send encoded states, it batches whatever is pending (up to 256, 2 ms gather window) and reloads weights every 2 s if the learner published | |
-| network | preset `default` (10.33 M), `small` (3.83 M), `tiny` | `--model` |
+| network | 10.33 M parameters (`tiny` preset with `--smoke`) | |

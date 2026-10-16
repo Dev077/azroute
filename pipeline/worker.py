@@ -130,7 +130,7 @@ class Slot:
         """Advance until the search needs evaluations (returns the request list) or the visit ends (None)."""
         while True:
             if self.gen is None:
-                if self.n_left <= 0 or self.cfg.get("stop_flag") and os.path.exists(self.cfg["stop_flag"]):
+                if self.n_left <= 0 or os.path.exists(self.cfg["stop_flag"]):
                     return None
                 if self.cfg.get("until") and time.time() >= self.cfg["until"]:
                     return None
@@ -171,7 +171,7 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
     stop_flag = cfg["stop_flag"]
     parent = os.getppid()
     # a polish worker works on one case at a time (a polish visit is CPU-bound and long)
-    capacity = 1 if wid < cfg.get("polish_workers", 0) else cfg["concurrency"]
+    capacity = 1 if wid < cfg["polish_workers"] else cfg["concurrency"]
 
     def orphaned() -> bool:
         """The run process died (killed or crashed): this worker must not keep writing."""
@@ -224,7 +224,7 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
             search = Search(imp, n_full=ps["n_full"], n_fast=ps["n_fast"], p_full=ps["p_full"],
                             max_considered=ps["considered"], record=False,
                             rng=random.Random(rng.randrange(2 ** 32)))
-            scfg = dict(cfg, stop_flag=stop_flag, k_min=ps["k_min"], k_max=ps["k_max"], polish=True,
+            scfg = dict(cfg, k_min=ps["k_min"], k_max=ps["k_max"], polish=True,
                         until=time.time() + cfg["polish_seconds"])
             s = Slot(key, P, imp, search, 1 << 30, scfg, t0, start, ver)
             s.pending_req = s.next_request()
@@ -236,11 +236,11 @@ def _worker(wid: int, cfg: Dict, req_q, resp_q, infer_q, infer_resp_q) -> None:
         net.refresh()
         use_net = net.ready and rng.random() >= cfg["control_share"]
         search = Search(imp, n_full=cfg["n_full"], n_fast=cfg["n_fast"], p_full=cfg["p_full"],
-                        gumbel_scale=cfg["gumbel_scale"], max_considered=cfg.get("considered", 16),
-                        max_considered_fast=cfg.get("considered_fast"),
+                        gumbel_scale=cfg["gumbel_scale"], max_considered=cfg["considered"],
+                        max_considered_fast=cfg["considered_fast"],
                         rng=random.Random(rng.randrange(2 ** 32)),
                         defer=use_net, explore_fast=cfg["explore_fast"])
-        scfg = dict(cfg, stop_flag=stop_flag, k_max=hint.get("k_max", cfg["k_max"]))
+        scfg = dict(cfg, k_max=hint["k_max"])
         s = Slot(key, P, imp, search, n_search, scfg, t0, start, ver, use_net)
         s.pending_req = s.next_request()
         return s

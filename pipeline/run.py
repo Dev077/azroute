@@ -103,8 +103,6 @@ def main(argv=None) -> None:
     ap.add_argument("--n-full", type=int, default=128, help="evaluations per recorded (full) decision")
     ap.add_argument("--n-fast", type=int, default=8)
     ap.add_argument("--p-full", type=float, default=0.25)
-    ap.add_argument("--model", default="default", choices=["default", "small", "tiny"],
-                    help="network preset (model.PRESETS): default ~10M params, small ~3.7M, tiny for smoke runs")
     ap.add_argument("--sync-minutes", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true", help="force CPU (local testing)")
@@ -117,7 +115,6 @@ def main(argv=None) -> None:
     from routing.tiers import TIER_DIRS, all_cases
 
     if a.smoke:
-        a.model = "tiny"
         a.min_records, a.warmup_steps, a.n_full, a.n_fast = 50, 30, 16, 4
         a.tiers = a.tiers if a.tiers != "all" else "hard"
 
@@ -137,9 +134,7 @@ def main(argv=None) -> None:
     prev_deadline = prev_cfg.get("deadline_epoch")
     if prev_deadline and prev_deadline > time.time():
         deadline = prev_deadline
-        # keeps the LR schedule's position; configs from before start_epoch was stored rebuild it
-        start_epoch = prev_cfg.get("start_epoch") or (
-            deadline - (prev_cfg.get("hours") or 23.5) * 3600 + prev_cfg.get("export_minutes", 20.0) * 60)
+        start_epoch = prev_cfg["start_epoch"]      # keeps the LR schedule's position
         log(f"keeping the original deadline: {(deadline - time.time()) / 3600:.2f} h left")
     else:
         start_epoch = time.time()
@@ -197,7 +192,7 @@ def main(argv=None) -> None:
         model, ck = load_model(model_path, device)
         log(f"loaded model ({ck.get('steps', 0)} steps)")
     else:
-        model = RouteNet.preset(a.model, layers).to(device)
+        model = RouteNet.preset("tiny" if a.smoke else "default", layers).to(device)
     trainer = Trainer(model, device, lr=a.lr, warmup=200 if a.smoke else 1000)
     if os.path.exists(learner_path):
         try:

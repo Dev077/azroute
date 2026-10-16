@@ -38,7 +38,7 @@ def _serve(cfg: Dict, infer_q, infer_resp_qs, log_q) -> None:
     import torch
     from network.model import collate, load_model
     torch.set_num_threads(2)
-    device = torch.device("cuda" if torch.cuda.is_available() and not cfg.get("cpu") else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and not cfg["cpu"] else "cpu")
     path = os.path.join(cfg["work"], "model.pt")
     parent = os.getppid()
     model, mtime, last_check = None, 0.0, 0.0
