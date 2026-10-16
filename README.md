@@ -250,7 +250,7 @@ core/        C++ routing core (pybind11): ownership, A* trees, rip-up, rollback,
 routing/     a case loaded into the core, routing modes, the improvement loop, the tiers
 search/      Gumbel sequential-halving search over routing decisions; training records
 network/     input encoding, the network, the learner, the batched inference process
-pipeline/    the training run, worker processes, one-shot evaluation, checked export
+pipeline/    the training run, worker processes, checked export
 tools/       acceptance-rule benchmark
 notebooks/   Colab notebook for the training run
 tests/       legality and exact delay vs the m3d checker, rollback, exact replay, network plumbing
