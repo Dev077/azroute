@@ -59,6 +59,9 @@ Up to 20 minutes per case on a Colab G4 (AMD EPYC 9B45 with 44 threads in use, N
 ## Architecture
 
 <!-- architecture diagram -->
+<p align="center">
+  <img src="docs/azroute.png">
+</p>
 
 azroute never builds a routing from scratch with the network. It starts from a legal routing and
 improves it one neighbourhood at a time, so **the routing is legal at every moment of the run**.
